@@ -1,169 +1,66 @@
-// The level-up choices: twelve upgrades, each with a name, a plain description,
-// an icon key the renderer draws, a stack limit, and the change it makes to the
-// player's modifiers. rollUpgrades deals three different ones the player can
-// still take; Second Wind is rare, the rest are evenly dealt.
-
-export const UPGRADES = [
-  {
-    id: 'swift-fins',
-    name: 'Swift Fins',
-    blurb: 'Swim 12% faster.',
-    icon: 'fins',
-    max: 5,
-    apply(mods) {
-      mods.speedMul *= 1.12;
-    },
-  },
-  {
-    id: 'rapid-glow',
-    name: 'Rapid Glow',
-    blurb: 'Shoot 18% faster.',
-    icon: 'bolt',
-    max: 5,
-    apply(mods) {
-      mods.fireMul *= 1.18;
-    },
-  },
-  {
-    id: 'bright-bolts',
-    name: 'Bright Bolts',
-    blurb: 'Bolts deal +1 damage.',
-    icon: 'star',
-    max: 5,
-    apply(mods) {
-      mods.damage += 1;
-    },
-  },
-  {
-    id: 'twin-lantern',
-    name: 'Twin Lantern',
-    blurb: 'Fire one extra bolt, fanned out.',
-    icon: 'twin',
-    max: 2,
-    apply(mods) {
-      mods.projectiles += 1;
-    },
-  },
-  {
-    id: 'long-reach',
-    name: 'Long Reach',
-    blurb: 'Bolts fly 30% faster and farther.',
-    icon: 'reach',
-    max: 3,
-    apply(mods) {
-      mods.bulletSpeedMul *= 1.3;
-      mods.bulletLifeMul *= 1.3;
-    },
-  },
-  {
-    id: 'wide-net',
-    name: 'Wide Net',
-    blurb: 'Glimmers drift to you from 45% farther.',
-    icon: 'net',
-    max: 3,
-    apply(mods) {
-      mods.magnetMul *= 1.45;
-    },
-  },
-  {
-    id: 'sturdy-scales',
-    name: 'Sturdy Scales',
-    blurb: '+1 max heart, and heal 2 hearts.',
-    icon: 'scales',
-    max: 4,
-    apply(mods, player) {
-      player.maxHp += 1;
-      player.hp = Math.min(player.maxHp, player.hp + 2);
-    },
-  },
-  {
-    id: 'quick-dash',
-    name: 'Quick Dash',
-    blurb: 'Dash recharges 25% faster.',
-    icon: 'dash',
-    max: 3,
-    apply(mods) {
-      mods.dashCooldownMul *= 0.75;
-    },
-  },
-  {
-    id: 'piercing-light',
-    name: 'Piercing Light',
-    blurb: 'Bolts pass through +1 foe.',
-    icon: 'pierce',
-    max: 3,
-    apply(mods) {
-      mods.pierce += 1;
-    },
-  },
-  {
-    id: 'glimmer-luck',
-    name: 'Glimmer Luck',
-    blurb: 'Bolts crit for double damage 15% of the time.',
-    icon: 'luck',
-    max: 3,
-    apply(mods) {
-      mods.critChance += 0.15;
-    },
-  },
-  {
-    id: 'second-wind',
-    name: 'Second Wind',
-    blurb: 'Revive once with 3 hearts when you fall.',
-    icon: 'wind',
-    max: 1,
-    rare: true,
-    apply(mods) {
-      mods.revive = true;
-    },
-  },
-  {
-    id: 'reef-shield',
-    name: 'Reef Shield',
-    blurb: 'A shard orbits you and wounds foes it touches.',
-    icon: 'shield',
-    max: 2,
-    apply(mods) {
-      mods.shields += 1;
-    },
-  },
+// The draft: every 5 levels the game pauses and offers 3 upgrades from a
+// pool of 18, with one free reroll per draft and paid rerolls after that.
+// Each upgrade mutates the player's derived stats; stacks are capped.
+export const UPGRADE_POOL = [
+  { id: 'bit', name: 'Sharper Bit', desc: '+40% drill damage', max: 3, icon: 'drill', apply: (s) => { s.drillDamage *= 1.4; } },
+  { id: 'turbo', name: 'Turbo Drill', desc: '+25% drill speed', max: 3, icon: 'bolt', apply: (s) => { s.drillSpeed *= 1.25; } },
+  { id: 'hull', name: 'Reinforced Hull', desc: '+30 max hull, heal 30', max: 3, icon: 'shield', apply: (s) => { s.maxHull += 30; s.heal = (s.heal ?? 0) + 30; } },
+  { id: 'sinks', name: 'Heat Sinks', desc: '+40 max heat', max: 3, icon: 'snow', apply: (s) => { s.maxHeat += 40; } },
+  { id: 'coolant', name: 'Coolant Loop', desc: '+60% heat dissipation', max: 3, icon: 'drop', apply: (s) => { s.heatCool *= 1.6; } },
+  { id: 'magnet', name: 'Ore Magnet', desc: '+60% pickup radius', max: 3, icon: 'magnet', apply: (s) => { s.magnet *= 1.6; } },
+  { id: 'boots', name: 'Swift Boots', desc: '+15% move speed', max: 3, icon: 'boot', apply: (s) => { s.moveSpeed *= 1.15; } },
+  { id: 'satchel', name: 'Bomb Satchel', desc: '+3 max bombs, +3 bombs now', max: 3, icon: 'bomb', apply: (s) => { s.maxBombs += 3; s.bombs += 3; } },
+  { id: 'bigbombs', name: 'Big Bombs', desc: '+50% bomb blast', max: 3, icon: 'blast', apply: (s) => { s.bombPower *= 1.5; } },
+  { id: 'gemsense', name: 'Gem Sense', desc: '+50% gem drops', max: 3, icon: 'gem', apply: (s) => { s.gemLuck *= 1.5; } },
+  { id: 'skin', name: 'Thick Skin', desc: '-20% damage taken', max: 3, icon: 'plate', apply: (s) => { s.armor *= 0.8; } },
+  { id: 'secondwind', name: 'Second Wind', desc: 'Revive once at 50% hull', max: 1, icon: 'heart', apply: (s) => { s.revive = true; } },
+  { id: 'reach', name: 'Long Reach', desc: 'Drill bites 2 tiles deep', max: 2, icon: 'reach', apply: (s) => { s.drillReach += 1; } },
+  { id: 'plating', name: 'Lava Plating', desc: '-50% lava and heat damage', max: 2, icon: 'flame', apply: (s) => { s.lavaArmor *= 0.5; } },
+  { id: 'adrenaline', name: 'Adrenaline', desc: '+20% speed and drill below 30% hull', max: 2, icon: 'pulse', apply: (s) => { s.adrenaline += 1; } },
+  { id: 'lucky', name: 'Lucky Charm', desc: '+25% score', max: 3, icon: 'clover', apply: (s) => { s.scoreMult *= 1.25; } },
+  { id: 'powerdrill', name: 'Power Drill', desc: '+100% drill damage to enemies', max: 2, icon: 'fist', apply: (s) => { s.enemyDrill *= 2; } },
+  { id: 'frame', name: 'Sturdy Frame', desc: '-60% crush damage', max: 2, icon: 'anvil', apply: (s) => { s.crushArmor *= 0.4; } },
 ];
 
-/** The player's starting modifiers; upgrades multiply or add to these. */
-export function freshModifiers() {
+export function baseStats(difficulty) {
   return {
-    speedMul: 1,
-    fireMul: 1,
-    damage: 0,
-    projectiles: 1,
-    bulletSpeedMul: 1,
-    bulletLifeMul: 1,
-    magnetMul: 1,
-    dashCooldownMul: 1,
-    pierce: 0,
-    critChance: 0,
+    drillDamage: 1,
+    drillSpeed: 1,
+    maxHull: difficulty.startHull,
+    heal: 0,
+    maxHeat: 100,
+    heatCool: 1,
+    magnet: 70,
+    moveSpeed: 1,
+    maxBombs: 5,
+    bombs: 3,
+    bombPower: 1,
+    gemLuck: 1,
+    armor: 1,
     revive: false,
-    shields: 0,
-    stacks: {},
+    drillReach: 1,
+    lavaArmor: 1,
+    adrenaline: 0,
+    scoreMult: difficulty.scoreMult,
+    enemyDrill: 1,
+    crushArmor: 1,
   };
 }
 
-/** Deal `count` different upgrades the player can still stack, shuffled. */
-export function rollUpgrades(random, mods, count = 3) {
-  const available = UPGRADES.filter((upgrade) => (mods.stacks[upgrade.id] ?? 0) < upgrade.max);
-  const dealt = [];
-  const pool = available.slice();
-  while (dealt.length < count && pool.length > 0) {
-    const index = Math.floor(random.next() * pool.length);
-    const [upgrade] = pool.splice(index, 1);
-    if (upgrade.rare && random.chance(0.5) && pool.length >= count - dealt.length) continue;
-    dealt.push(upgrade);
+/** Roll `count` distinct draft options, skipping upgrades at their cap. */
+export function rollDraft(rand, owned, count) {
+  const available = UPGRADE_POOL.filter((u) => (owned[u.id] ?? 0) < u.max);
+  const options = [];
+  const bag = available.slice();
+  while (options.length < count && bag.length > 0) {
+    const index = Math.floor(rand.next() * bag.length);
+    options.push(bag.splice(index, 1)[0]);
   }
-  return dealt;
+  return options;
 }
 
-/** Take an upgrade: count the stack and apply its effect. */
-export function takeUpgrade(upgrade, mods, player) {
-  mods.stacks[upgrade.id] = (mods.stacks[upgrade.id] ?? 0) + 1;
-  upgrade.apply(mods, player);
+export function applyUpgrade(stats, owned, upgrade) {
+  owned[upgrade.id] = (owned[upgrade.id] ?? 0) + 1;
+  upgrade.apply(stats);
+  return stats;
 }

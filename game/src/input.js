@@ -1,149 +1,118 @@
-// Keyboard and mouse, read by the loop. Held keys give a steering vector;
-// the mouse gives an aim point in field coordinates and a held fire button.
-// One-shot presses (confirm, pause, mute, dash, upgrade choices) are queued as
-// bit flags and taken once, so a press between two frames is never lost and
-// never counted twice. Clicks are also queued with their field coordinates,
-// so menus and upgrade cards can be clicked.
-
+// Keyboard and mouse state, read fresh every frame. Menu clicks are queued
+// as events so a click is never eaten by a screen change mid-frame.
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
-export const ACTION_MUTE = 4;
-export const ACTION_DASH = 8;
-export const ACTION_CHOICE_1 = 16;
-export const ACTION_CHOICE_2 = 32;
-export const ACTION_CHOICE_3 = 64;
-export const ACTION_RESTART = 128;
-
-const UP = new Set(['ArrowUp', 'KeyW']);
-const DOWN = new Set(['ArrowDown', 'KeyS']);
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const FIRE = new Set(['Space']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
-const MUTE = new Set(['KeyM']);
-const DASH = new Set(['ShiftLeft', 'ShiftRight']);
-const RESTART = new Set(['KeyR']);
-const CHOICES = new Map([
-  ['Digit1', ACTION_CHOICE_1],
-  ['Digit2', ACTION_CHOICE_2],
-  ['Digit3', ACTION_CHOICE_3],
-  ['Numpad1', ACTION_CHOICE_1],
-  ['Numpad2', ACTION_CHOICE_2],
-  ['Numpad3', ACTION_CHOICE_3],
-]);
+export const ACTION_REROLL = 4;
+export const ACTION_MUTE = 8;
 
 export function createInput(canvas) {
-  const held = new Set();
-  let actions = 0;
-  let clicks = [];
-  let mouseDown = false;
-  let mouseSeen = false;
-  let mouseClientX = 0;
-  let mouseClientY = 0;
-  let toField = (x, y) => ({ x, y });
+  const keys = new Set();
+  const clicks = [];
+  const input = {
+    mouseX: 0,
+    mouseY: 0,
+    mouseDown: false,
+    rightDown: false,
+    actions: 0,
+  };
 
-  window.addEventListener('keydown', (event) => {
-    if (UP.has(event.code) || DOWN.has(event.code) || LEFT.has(event.code) || RIGHT.has(event.code)) {
-      held.add(event.code);
-    } else if (FIRE.has(event.code)) {
-      held.add(event.code);
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else if (MUTE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_MUTE;
-    } else if (DASH.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_DASH;
-    } else if (RESTART.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_RESTART;
-    } else if (CHOICES.has(event.code)) {
-      if (!event.repeat) actions |= CHOICES.get(event.code);
+  function toGame(e) {
+    const rect = canvas.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * 1280,
+      y: ((e.clientY - rect.top) / rect.height) * 720,
+    };
+  }
+
+  function onKeyDown(e) {
+    if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'ArrowDown', ' '].includes(e.key)) e.preventDefault();
+    if (e.repeat) return;
+    keys.add(e.code);
+    if (e.code === 'Enter' || e.code === 'Space') input.actions |= ACTION_CONFIRM;
+    if (e.code === 'KeyP' || e.code === 'Escape') input.actions |= ACTION_PAUSE;
+    if (e.code === 'KeyR') input.actions |= ACTION_REROLL;
+    if (e.code === 'KeyM') input.actions |= ACTION_MUTE;
+    if (e.code === 'Digit1') input.choice = 0;
+    if (e.code === 'Digit2') input.choice = 1;
+    if (e.code === 'Digit3') input.choice = 2;
+  }
+
+  function onKeyUp(e) {
+    keys.delete(e.code);
+  }
+
+  function onMove(e) {
+    const p = toGame(e);
+    input.mouseX = p.x;
+    input.mouseY = p.y;
+  }
+
+  function onDown(e) {
+    const p = toGame(e);
+    input.mouseX = p.x;
+    input.mouseY = p.y;
+    if (e.button === 2) {
+      input.rightDown = true;
     } else {
-      return;
+      input.mouseDown = true;
+      clicks.push({ x: p.x, y: p.y });
     }
-    event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    held.delete(event.code);
-  });
-  window.addEventListener('blur', () => {
-    held.clear();
-    mouseDown = false;
-  });
+  }
 
-  canvas.addEventListener('pointermove', (event) => {
-    mouseSeen = true;
-    mouseClientX = event.clientX;
-    mouseClientY = event.clientY;
-  });
-  canvas.addEventListener('pointerdown', (event) => {
-    mouseSeen = true;
-    mouseClientX = event.clientX;
-    mouseClientY = event.clientY;
-    if (event.button === 2) {
-      actions |= ACTION_DASH;
-      return;
-    }
-    if (event.button === 0) {
-      mouseDown = true;
-      actions |= ACTION_CONFIRM;
-      clicks.push(toField(event.clientX, event.clientY));
-    }
-  });
-  window.addEventListener('pointerup', (event) => {
-    if (event.button === 0) mouseDown = false;
-  });
-  canvas.addEventListener('contextmenu', (event) => {
-    event.preventDefault();
-  });
+  function onUp(e) {
+    if (e.button === 2) input.rightDown = false;
+    else input.mouseDown = false;
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  canvas.addEventListener('mousemove', onMove);
+  canvas.addEventListener('mousedown', onDown);
+  window.addEventListener('mouseup', onUp);
+  canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
   return {
-    /** The renderer sets this after each resize, so clicks map to field pixels. */
-    setFieldTransform(transform) {
-      toField = transform;
+    state: input,
+    down(code) {
+      return keys.has(code);
     },
-    /** Steering vector from held keys, normalised so diagonals match cardinals. */
-    moveVector() {
-      let x = 0;
-      let y = 0;
-      for (const code of held) {
-        if (LEFT.has(code)) x -= 1;
-        else if (RIGHT.has(code)) x += 1;
-        else if (UP.has(code)) y -= 1;
-        else if (DOWN.has(code)) y += 1;
-      }
-      if (x !== 0 && y !== 0) {
-        x *= Math.SQRT1_2;
-        y *= Math.SQRT1_2;
-      }
-      return { x, y };
+    axis() {
+      const left = keys.has('ArrowLeft') || keys.has('KeyA');
+      const right = keys.has('ArrowRight') || keys.has('KeyD');
+      return (right ? 1 : 0) - (left ? 1 : 0);
     },
-    /** True while the fire button or Space is held. */
-    firing() {
-      return mouseDown || held.has('Space');
+    jumpHeld() {
+      return keys.has('ArrowUp') || keys.has('KeyW') || keys.has('Space');
     },
-    /** The mouse aim point in field coordinates. */
-    aimPoint() {
-      return toField(mouseClientX, mouseClientY);
+    digDownHeld() {
+      return keys.has('ArrowDown') || keys.has('KeyS');
     },
-    /** True once the pointer has moved or clicked over the game. */
-    hasPointer() {
-      return mouseSeen;
+    digUpHeld() {
+      return keys.has('ArrowUp') || keys.has('KeyW');
     },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
+    bombPressed() {
+      return keys.has('KeyE') || keys.has('KeyQ') || keys.has('KeyK');
+    },
     takeActions() {
-      const taken = actions;
-      actions = 0;
-      return taken;
+      const a = input.actions;
+      input.actions = 0;
+      return a;
     },
-    /** Clicks since the last call, each {x, y} in field coordinates. */
     takeClicks() {
-      const taken = clicks;
-      clicks = [];
-      return taken;
+      return clicks.splice(0, clicks.length);
+    },
+    takeChoice() {
+      const c = input.choice;
+      input.choice = undefined;
+      return c;
+    },
+    clear() {
+      keys.clear();
+      clicks.length = 0;
+      input.actions = 0;
+      input.choice = undefined;
+      input.mouseDown = false;
+      input.rightDown = false;
     },
   };
 }

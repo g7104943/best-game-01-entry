@@ -2,9 +2,8 @@ html, body {
   margin: 0;
   height: 100%;
   overflow: hidden;
-  background: #050b18;
+  background: #14101a;
 }
-
 #game {
   position: fixed;
   inset: 0;
@@ -14,7 +13,6 @@ html, body {
   touch-action: none;
   cursor: crosshair;
 }
-
 /* Read aloud, never shown: the status line screen readers announce. */
 #status {
   position: absolute;

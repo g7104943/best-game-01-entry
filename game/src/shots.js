@@ -1,236 +1,298 @@
-// The screenshot scenes behind ?shot=title|play|choice|end. Each one plays the
-// real rules forward from a fresh world for a fixed time, steered by a simple
-// autopilot, so every frame is what a real game looks like and the same seed
-// always gives the same frame. The play pilot kites, gathers and shoots; the
-// end pilot drifts and never fires, so the gloom catches it.
+// The screenshot scenes behind ?shot=start|draft|cover|victory|end. Each one
+// plays the real rules forward from a fresh world with a simple autopilot,
+// exactly as the starter does: the frame is what a real game looks like, and
+// the same seed always gives the same frame. The cover and victory scenes
+// grant the staged run a strong drafted build (through the same applyUpgrade
+// the draft screen uses) so the autopilot can reach the boss and beat it;
+// every pixel is still the game's own simulation and renderer.
+import { BOSS_LEVEL, STEP, TILE, VIEW_H } from './config.js';
+import { T_EMPTY, T_LAVA, isDiggable, tileAt } from './tiles.js';
+import { createWorld, EVENT_BOSS, EVENT_DRAFT, EVENT_OVER, EVENT_WIN, stepWorld } from './world.js';
+import { applyUpgrade, rollDraft, UPGRADE_POOL } from './upgrades.js';
+import { SCREEN_DRAFT, SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 
-import { FIELD, STEP } from './config.js';
-import { createRandom } from './random.js';
-import { KIND_BOSS } from './enemies.js';
-import { EVENT_OVER, EVENT_WIN } from './world.js';
-import { SCREEN_CHOICE, SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE } from './render.js';
-import { rollUpgrades, takeUpgrade } from './upgrades.js';
+const MAX_STEPS = 60 * 900;
 
-const TITLE_SECONDS = 6;
-const PLAY_SECONDS = 60;
-const FIGHT_SECONDS = 25;
-const CHOICE_LIMIT_SECONDS = 120;
-const END_LIMIT_SECONDS = 600;
-const FLEE_RANGE = 175;
-const GATHER_RANGE = 380;
-
-/** The nearest active foe to the player, preferring the boss. */
-function nearestFoe(state) {
-  if (state.boss !== null && state.boss.active) return state.boss;
-  let best = null;
-  let bestDist = Infinity;
-  for (const foe of state.foes) {
-    if (!foe.active) continue;
-    const dist = Math.hypot(foe.x - state.player.x, foe.y - state.player.y);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = foe;
-    }
-  }
-  return best;
-}
-
-function nearestPickup(state) {
-  let best = null;
-  let bestDist = Infinity;
-  for (const pickup of state.pickups) {
-    if (!pickup.active) continue;
-    const dist = Math.hypot(pickup.x - state.player.x, pickup.y - state.player.y);
-    if (dist < bestDist) {
-      bestDist = dist;
-      best = pickup;
-    }
-  }
-  return best;
-}
-
-/** A competent pilot: flee what is close, gather glimmers, kite the rest. */
-function pilotPlay(state) {
-  const player = state.player;
-  const foe = nearestFoe(state);
-  let moveX = 0;
-  let moveY = 0;
-  let dash = false;
-  if (foe !== null) {
-    const dx = player.x - foe.x;
-    const dy = player.y - foe.y;
-    const dist = Math.max(1, Math.hypot(dx, dy));
-    if (dist < FLEE_RANGE) {
-      // Escape on a curve: away from the foe, bending sideways, so the
-      // flight does not pin the fish against a wall.
-      moveX = (dx / dist) * 0.85 + (-dy / dist) * 0.5;
-      moveY = (dy / dist) * 0.85 + (dx / dist) * 0.5;
-      if (dist < 95 && player.dashCooldown <= 0) dash = true;
-    } else {
-      // Strafe around the foe at mid range, drifting toward glimmers.
-      const pickup = nearestPickup(state);
-      if (pickup !== null && Math.hypot(pickup.x - player.x, pickup.y - player.y) < GATHER_RANGE) {
-        moveX = (pickup.x - player.x) / Math.max(1, Math.hypot(pickup.x - player.x, pickup.y - player.y));
-        moveY = (pickup.y - player.y) / Math.max(1, Math.hypot(pickup.x - player.x, pickup.y - player.y));
-      } else {
-        moveX = (-dy / dist) * 0.9;
-        moveY = (dx / dist) * 0.9;
-        if (dist > 340) {
-          moveX += (foe.x - player.x) / dist * 0.5;
-          moveY += (foe.y - player.y) / dist * 0.5;
-        }
-      }
-    }
-  } else {
-    const pickup = nearestPickup(state);
-    if (pickup !== null) {
-      const dist = Math.max(1, Math.hypot(pickup.x - player.x, pickup.y - player.y));
-      moveX = (pickup.x - player.x) / dist;
-      moveY = (pickup.y - player.y) / dist;
-    }
-  }
-  const len = Math.hypot(moveX, moveY);
-  if (len > 1) {
-    moveX /= len;
-    moveY /= len;
-  }
-  // A gentle pull toward the middle keeps the fight in view.
-  const centreX = FIELD.width / 2 - player.x;
-  const centreY = FIELD.height / 2 - player.y;
-  const centreDist = Math.hypot(centreX, centreY);
-  if (centreDist > 240) {
-    const pull = Math.min(0.9, (centreDist - 240) / 250);
-    moveX += (centreX / centreDist) * pull;
-    moveY += (centreY / centreDist) * pull;
-    const total = Math.hypot(moveX, moveY);
-    if (total > 1) {
-      moveX /= total;
-      moveY /= total;
-    }
-  }
-  const aim = foe === null ? { x: player.x + 100, y: player.y } : { x: foe.x, y: foe.y };
-  return { move: { x: moveX, y: moveY }, aim, firing: foe !== null, dash };
-}
-
-/** A hapless pilot: drifts toward the middle, never fires, never dashes. */
-function pilotEnd(state) {
-  const player = state.player;
-  const dx = FIELD.width / 2 - player.x;
-  const dy = FIELD.height / 2 - player.y;
-  const dist = Math.max(1, Math.hypot(dx, dy));
-  const speed = Math.min(1, dist / 200);
+function fakeInput() {
+  const state = { mouseDown: false, rightDown: false, mouseX: 640, mouseY: 360 };
   return {
-    move: { x: (dx / dist) * speed * 0.4, y: (dy / dist) * speed * 0.4 },
-    aim: { x: player.x + 100, y: player.y },
-    firing: false,
-    dash: false,
+    state,
+    axisValue: 0,
+    jump: false,
+    down: false,
+    up: false,
+    bomb: false,
+    axis() {
+      return this.axisValue;
+    },
+    jumpHeld() {
+      return this.jump;
+    },
+    digDownHeld() {
+      return this.down;
+    },
+    digUpHeld() {
+      return this.up;
+    },
+    bombPressed() {
+      return this.bomb;
+    },
   };
 }
 
-/**
- * Set `world` to the named scene and return the screen to draw over it, the
- * best score to show, and any upgrade choices to offer.
- */
-export function stageShot(name, world, seed) {
-  const stagingRandom = createRandom((seed ^ 0x5f3a) >>> 0);
-  world.reset();
-  if (name !== 'play' && name !== 'choice' && name !== 'end') {
-    for (let index = 0; index < TITLE_SECONDS / STEP; index += 1) {
-      world.step(STEP, { move: { x: 0, y: 0 }, aim: { x: 0, y: 0 }, firing: false, dash: false }, true);
+function tileBelow(world) {
+  const p = world.player;
+  return tileAt(world.tiles, Math.floor(p.x / TILE), Math.floor((p.y + 2) / TILE));
+}
+
+function nearestEnemy(world, maxDist) {
+  const p = world.player;
+  let best = null;
+  let bestD = maxDist;
+  for (const e of world.enemies) {
+    if (e.dead) continue;
+    const d = Math.hypot(e.x - p.x, e.y - p.y);
+    if (d < bestD) {
+      bestD = d;
+      best = e;
     }
-    return { screen: SCREEN_TITLE, best: 0, choices: null };
+  }
+  return best;
+}
+
+/** Steer the pilot: dig down, skirt lava, rest when hot, fight when close. */
+function pilotDig(world, input, memory) {
+  const p = world.player;
+  input.axisValue = 0;
+  input.jump = false;
+  input.down = false;
+  input.up = false;
+  input.bomb = false;
+  input.state.mouseDown = false;
+
+  // Rest the drill when it is about to overheat.
+  if (p.heat > world.stats.maxHeat * 0.82) {
+    memory.resting = true;
+  }
+  if (memory.resting) {
+    if (p.heat < world.stats.maxHeat * 0.4) memory.resting = false;
+    else return;
   }
 
+  // Fight anything close: aim the drill at it.
+  const foe = nearestEnemy(world, 90);
+  if (foe) {
+    input.state.mouseDown = true;
+    input.state.mouseX = foe.x;
+    input.state.mouseY = foe.y - foe.height / 2 - world.cameraY;
+    input.axisValue = foe.x > p.x ? 1 : -1;
+    return;
+  }
+
+  const below = tileBelow(world);
+  if (below === T_LAVA) {
+    // Skirt the lava: dig sideways toward the nearer open column.
+    const left = tileAt(world.tiles, Math.floor(p.x / TILE) - 2, Math.floor((p.y + 2) / TILE));
+    const right = tileAt(world.tiles, Math.floor(p.x / TILE) + 2, Math.floor((p.y + 2) / TILE));
+    input.axisValue = left === T_EMPTY ? -1 : right === T_EMPTY ? 1 : memory.side;
+    if (world.rand.next() < 0.01) memory.side *= -1;
+    return;
+  }
+  if (isDiggable(below)) {
+    input.down = true;
+    return;
+  }
+  if (below === T_EMPTY) {
+    // Falling or walking: head for the shaft the world carved (near centre).
+    const shaftX = 16 * TILE;
+    if (Math.abs(p.x - shaftX) > 60 && p.onGround) {
+      input.axisValue = p.x < shaftX ? 1 : -1;
+    }
+    return;
+  }
+  // Bedrock below: dig sideways.
+  input.axisValue = memory.side;
+  if (world.rand.next() < 0.005) memory.side *= -1;
+}
+
+/** Fight the wyrm: close in to drill, dodge the telegraph, bomb often. */
+function pilotBoss(world, input, memory) {
+  const p = world.player;
+  const boss = world.boss;
+  input.axisValue = 0;
+  input.jump = false;
+  input.down = false;
+  input.up = false;
+  input.bomb = false;
+  input.state.mouseDown = false;
+  if (!boss || boss.dead) return;
+
+  const dx = boss.x - p.x;
+  const dist = Math.hypot(dx, boss.y - (p.y - 18));
+  memory.bombCd = Math.max(0, (memory.bombCd ?? 0) - STEP);
+  memory.strafe = (memory.strafe ?? 0) - STEP;
+  if (memory.strafe <= 0) {
+    memory.strafe = 0.5;
+    memory.strafeDir = (memory.strafeDir ?? 1) * -1;
+  }
+
+  // Hurt and hearts on the floor: go and get them before fighting on.
+  if (p.hull < world.stats.maxHull * 0.35) {
+    let heart = null;
+    let heartD = 1e9;
+    for (const pk of world.pickups) {
+      if (pk.kind !== 'heart') continue;
+      const d = Math.abs(pk.x - p.x) + Math.abs(pk.y - p.y);
+      if (d < heartD) {
+        heartD = d;
+        heart = pk;
+      }
+    }
+    if (heart) {
+      input.axisValue = heart.x > p.x ? 1 : -1;
+      if (heart.y < p.y - 80) input.jump = true;
+      return;
+    }
+  }
+
+  if (boss.state === 'windup' || boss.state === 'charge') {
+    // Get out of the line: run perpendicular and jump the charge.
+    input.axisValue = dx > 0 ? -1 : 1;
+    if (boss.state === 'charge' && Math.abs(dx) < 200) input.jump = true;
+    return;
+  }
+  if (boss.state === 'spit') {
+    // Strafe while the globs fly: a moving target is hard to hit.
+    input.axisValue = memory.strafeDir;
+    if (dist < 70) {
+      input.state.mouseDown = true;
+      input.state.mouseX = boss.x;
+      input.state.mouseY = boss.y - world.cameraY;
+    }
+  } else if (dist > 70) {
+    input.axisValue = dx > 0 ? 1 : -1;
+    if (boss.y < p.y - 90) input.jump = true;
+  } else if (dist < 45) {
+    // Back out of contact range but stay inside drill reach.
+    input.axisValue = dx > 0 ? -1 : 1;
+  } else {
+    input.state.mouseDown = true;
+    input.state.mouseX = boss.x;
+    input.state.mouseY = boss.y - world.cameraY;
+  }
+  if (dist < 150 && p.bombs > 0 && memory.bombCd <= 0) {
+    input.bomb = true;
+    memory.bombCd = 2.5;
+  }
+}
+
+function grantBuild(world, ids) {
+  for (const id of ids) {
+    const def = UPGRADE_POOL.find((u) => u.id === id);
+    if (def) applyUpgrade(world.stats, world.owned, def);
+  }
+  world.player.hull = world.stats.maxHull;
+  world.player.bombs = world.stats.maxBombs;
+}
+
+function autoDraft(world) {
+  if (world.player.dead) return;
+  const options = rollDraft(world.rand, world.owned, 3);
+  if (options.length > 0) {
+    const pick = options[0];
+    applyUpgrade(world.stats, world.owned, pick);
+    if (world.stats.heal) {
+      world.player.hull = Math.min(world.stats.maxHull, world.player.hull + world.stats.heal);
+      world.stats.heal = 0;
+    }
+  }
+  world.draftPending = false;
+}
+
+function runPilot(world, input, mode, stopWhen, autoPick = true) {
+  const memory = { side: 1, resting: false, bombCd: 0 };
+  let bossSince = -1;
+  let crossed = null;
+  const trail = [];
+  for (let step = 0; step < MAX_STEPS; step += 1) {
+    if (world.boss && !world.boss.dead) pilotBoss(world, input, memory);
+    else pilotDig(world, input, memory);
+    const events = stepWorld(world, input, STEP);
+    const row = Math.floor(world.player.y / TILE);
+    trail.push(`${step}:y${Math.round(world.player.y)} r${row} vy${Math.round(world.player.vy)} g${world.player.onGround ? 1 : 0} gen${world.tiles.generated} ft${tileAt(world.tiles, Math.floor(world.player.x / TILE), row)}`);
+    if (trail.length > 10) trail.shift();
+    if (!crossed && row >= 360) {
+      const px = Math.floor(world.player.x / TILE);
+      const col = [];
+      for (let y = 355; y <= 365; y += 1) col.push(`${y}:${tileAt(world.tiles, px, y)}`);
+      crossed = { step, x: Math.round(world.player.x), y: Math.round(world.player.y), vy: Math.round(world.player.vy), col: col.join(' '), trail: trail.join(' | ') };
+    }
+    if (events & EVENT_DRAFT && autoPick) autoDraft(world);
+    if (events & EVENT_BOSS) bossSince = world.time;
+    if (events & EVENT_OVER) return { outcome: 'dead', steps: step, crossed };
+    if (events & EVENT_WIN) return { outcome: 'win', steps: step, crossed };
+    const stop = stopWhen(world, step, bossSince);
+    if (stop) return { outcome: 'staged', steps: step, crossed };
+  }
+  return { outcome: 'timeout', steps: MAX_STEPS, crossed };
+}
+
+export function stageShot(name, world, ui) {
+  const input = fakeInput();
+  if (name === 'draft') {
+    const result = runPilot(world, input, 'draft', (w) => w.draftPending, false);
+    if (result.outcome === 'dead') return { screen: SCREEN_OVER, world };
+    ui.draftOptions = rollDraft(world.rand, world.owned, 3);
+    ui.draftOwned = world.owned;
+    ui.freeRerolls = world.freeRerolls;
+    return { screen: SCREEN_DRAFT, world };
+  }
   if (name === 'end') {
-    // Fight well for a while, gathering a real score, then stop fighting and
-    // let the gloom close in: the end screen shows a run that happened.
-    for (let index = 0; index < FIGHT_SECONDS / STEP; index += 1) {
-      world.step(STEP, pilotPlay(world.state), false);
-      if (world.state.pendingLevels > 0) {
-        const choices = rollUpgrades(stagingRandom, world.state.mods, 3);
-        if (choices.length > 0) takeUpgrade(choices[0], world.state.mods, world.state.player);
-        world.state.pendingLevels -= 1;
+    // A hurried run that stands in the lava: a genuine defeat screen.
+    for (let step = 0; step < MAX_STEPS; step += 1) {
+      input.axisValue = 0;
+      input.jump = false;
+      input.down = true;
+      input.up = false;
+      input.bomb = false;
+      input.state.mouseDown = false;
+      const events = stepWorld(world, input, STEP);
+      if (events & EVENT_OVER) return { screen: SCREEN_OVER, world };
+      if (events & EVENT_DRAFT) autoDraft(world);
+      if (events & EVENT_WIN) return { screen: SCREEN_WIN, world };
+    }
+    return { screen: SCREEN_OVER, world };
+  }
+  if (name === 'cover' || name === 'victory') {
+    grantBuild(world, ['bit', 'bit', 'turbo', 'hull', 'hull', 'sinks', 'coolant', 'powerdrill', 'satchel', 'bigbombs', 'skin', 'secondwind', 'plating', 'frame']);
+    if (name === 'cover') {
+      const result = runPilot(world, input, 'cover', (w, step, bossSince) => {
+        if (!w.boss || w.boss.dead) return false;
+        const fightTime = bossSince < 0 ? 0 : w.time - bossSince;
+        // The boss must be in frame with the player for the cover.
+        const inView = Math.abs(w.boss.x - w.player.x) < 480 && Math.abs(w.boss.y - w.player.y) < 300;
+        if (!inView || fightTime < 4) return false;
+        const exciting = w.boss.state === 'charge' || w.boss.state === 'spit' || w.boss.state === 'windup';
+        return exciting || fightTime > 20;
+      });
+      console.log('[stage] cover run:', result.outcome, 'steps', result.steps, 'level', world.level, 'hull', Math.round(world.player.hull), 'boss', world.boss ? `${Math.round(world.boss.hp)}hp ${world.boss.state}` : 'none', 'crossed', JSON.stringify(result.crossed));
+      if (result.outcome === 'dead' || result.outcome === 'timeout') {
+        // Fall back to a fresh world staged at a busy mid-game depth.
+        const fresh = createWorld(world.seed + 1, world.difficulty, world.audio);
+        grantBuild(fresh, ['bit', 'turbo', 'hull', 'magnet']);
+        const freshInput = fakeInput();
+        const fallback = runPilot(fresh, freshInput, 'cover', (w) => w.level >= 12);
+        console.log('[stage] cover fallback:', fallback.outcome, 'steps', fallback.steps, 'level', fresh.level, 'hull', Math.round(fresh.player.hull));
+        return { screen: SCREEN_PLAY, world: fresh };
       }
-      if (world.state.over) break;
+      return { screen: SCREEN_PLAY, world };
     }
-    for (let index = 0; index < END_LIMIT_SECONDS / STEP && !world.state.over; index += 1) {
-      const events = world.step(STEP, pilotEnd(world.state), false);
-      if (events & (EVENT_OVER | EVENT_WIN)) break;
-    }
-    return { screen: SCREEN_OVER, best: world.state.score, choices: null };
+    const result = runPilot(world, input, 'victory', () => false);
+    console.log('[stage] victory run:', result.outcome, 'steps', result.steps, 'level', world.level, 'hull', Math.round(world.player.hull), 'boss', world.boss ? `${Math.round(world.boss.hp)}hp phase ${world.boss.phase} ${world.boss.state}` : 'none', 'crossed', JSON.stringify(result.crossed));
+    if (result.outcome === 'win') return { screen: SCREEN_WIN, world };
+    return { screen: SCREEN_OVER, world };
   }
-
-  if (name === 'choice') {
-    for (let index = 0; index < CHOICE_LIMIT_SECONDS / STEP; index += 1) {
-      world.step(STEP, pilotPlay(world.state), false);
-      if (world.state.pendingLevels > 0) break;
-      if (world.state.over) break;
-    }
-    const choices = rollUpgrades(stagingRandom, world.state.mods, 3);
-    return { screen: SCREEN_CHOICE, best: world.state.score, choices };
-  }
-
-  // Play: two passes over the same seeded run. The first finds the liveliest
-  // frame; the second replays deterministically to exactly that frame, so the
-  // cover always shows the fight at its best.
-  for (const seconds of [PLAY_SECONDS, 26, 18]) {
-    const survey = surveyRun(world, stagingRandom, seconds);
-    if (!survey.alive && survey.bestSteps < 12 * 60) continue;
-    world.reset();
-    const replayRandom = createRandom((seed ^ 0x5f3a) >>> 0);
-    for (let index = 0; index < survey.bestSteps; index += 1) {
-      world.step(STEP, pilotPlay(world.state), false);
-      if (world.state.pendingLevels > 0) {
-        const choices = rollUpgrades(replayRandom, world.state.mods, 3);
-        if (choices.length > 0) takeUpgrade(choices[0], world.state.mods, world.state.player);
-        world.state.pendingLevels -= 1;
-      }
-    }
-    return { screen: SCREEN_PLAY, best: world.state.score, choices: null };
-  }
-  return { screen: SCREEN_PLAY, best: world.state.score, choices: null };
-}
-
-/**
- * Play a run with the pilot, scoring every frame after the opening seconds,
- * and report the liveliest step and whether the pilot survived the horizon.
- */
-function surveyRun(world, stagingRandom, seconds) {
-  world.reset();
-  let bestSteps = 0;
-  let bestScore = -1;
-  let steps = 0;
-  for (let index = 0; index < seconds / STEP; index += 1) {
-    const events = world.step(STEP, pilotPlay(world.state), false);
-    steps += 1;
-    if (world.state.pendingLevels > 0) {
-      const choices = rollUpgrades(stagingRandom, world.state.mods, 3);
-      if (choices.length > 0) takeUpgrade(choices[0], world.state.mods, world.state.player);
-      world.state.pendingLevels -= 1;
-    }
-    if (events & (EVENT_OVER | EVENT_WIN)) return { bestSteps, bestScore, alive: false };
-    if (world.state.elapsed > 10) {
-      const score = frameScore(world.state);
-      if (score > bestScore) {
-        bestScore = score;
-        bestSteps = steps;
-      }
-    }
-  }
-  return { bestSteps, bestScore, alive: true };
-}
-
-/** How lively a frame is: foes and bolts around, the player near the middle. A frame at the edge scores a fraction of a central one, however busy, and a frame with fewer than four foes never wins over a crowded one. */
-function frameScore(state) {
-  const player = state.player;
-  let foes = 0;
-  for (const foe of state.foes) if (foe.active) foes += 1;
-  let bolts = 0;
-  for (const bullet of state.bullets) if (bullet.active) bolts += 1;
-  let glimmers = 0;
-  for (const pickup of state.pickups) if (pickup.active) glimmers += 1;
-  const centreDist = Math.hypot(player.x - FIELD.width / 2, player.y - FIELD.height / 2);
-  const centred = centreDist < 180 ? 1 : centreDist < 300 ? 0.6 : 0.25;
-  const crowd = foes >= 4 ? foes * 3 : foes * 0.5;
-  return (crowd + Math.min(bolts, 4) + glimmers) * centred;
+  // 'start' and anything else: the title over the fresh world.
+  world.cameraY = -20;
+  return { screen: SCREEN_TITLE, world };
 }

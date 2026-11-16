@@ -1,232 +1,398 @@
-// The gloom: five foe kinds plus the boss, their stats, how each one moves and
-// attacks, and the wave director that decides what arrives each wave. Behaviour
-// lives here; the world owns the pools and calls steerEnemy with callbacks for
-// the things a foe can cause (spit a glob, burst, call for help).
+// The mountain's creatures and the Core Wyrm. Enemies are plain data the
+// world updates; each type has one small AI. The boss is a head plus a trail
+// of segments that follow its recorded path, with three phases: charges,
+// then magma spit and summons, then an enraged rain of ceiling rock.
+import { BOSS_HP, BOSS_SEGMENTS, ENEMY_TYPES, TILE } from './config.js';
+import { T_EMPTY, T_LAVA, isSolid, rowOfLevel, tileAt } from './tiles.js';
+import { burst, floatText } from './particles.js';
 
-import { BOSS, FIELD, WAVE } from './config.js';
-
-export const KIND_NIBBLER = 0;
-export const KIND_SPITTER = 1;
-export const KIND_SPLITTER = 2;
-export const KIND_DASHER = 3;
-export const KIND_MINI = 4;
-export const KIND_BOSS = 5;
-
-/** Base stats per kind; the wave scales health and speed from these. */
-export const ENEMY_DEFS = {
-  [KIND_NIBBLER]: { radius: 16, hp: 2, speed: 105, touch: 1, score: 10, glimmers: 1 },
-  [KIND_SPITTER]: { radius: 18, hp: 3, speed: 85, touch: 1, score: 25, glimmers: 2 },
-  [KIND_SPLITTER]: { radius: 22, hp: 4, speed: 70, touch: 1, score: 30, glimmers: 2, splitsInto: KIND_MINI, splitCount: 2 },
-  [KIND_DASHER]: { radius: 14, hp: 2, speed: 120, touch: 1, score: 20, glimmers: 1 },
-  [KIND_MINI]: { radius: 10, hp: 1, speed: 165, touch: 1, score: 5, glimmers: 1 },
-  [KIND_BOSS]: { radius: BOSS.radius, hp: BOSS.hp, speed: BOSS.speed, touch: BOSS.touchDamage, score: BOSS.score, glimmers: BOSS.glimmers },
-};
-
-/** Health and speed growth with the wave; speed growth is capped so foes stay fair. */
-export function scaledStats(kind, wave, finalWave) {
-  const def = ENEMY_DEFS[kind];
-  const hpMul = 1 + 0.09 * (wave - 1);
-  const speedMul = Math.min(1.3, 1 + 0.02 * (wave - 1));
-  if (kind === KIND_BOSS) {
-    return {
-      hp: wave >= finalWave ? BOSS.hpFinal : BOSS.hp,
-      speed: def.speed,
-      score: wave >= finalWave ? BOSS.scoreFinal : BOSS.score,
-    };
-  }
-  return { hp: Math.round(def.hp * hpMul), speed: def.speed * speedMul, score: def.score };
-}
-
-function distance(ax, ay, bx, by) {
-  return Math.hypot(bx - ax, by - ay);
-}
-
-/**
- * Steer one foe for a step. `ctx` carries the player, the clock, the random
- * source and the callbacks a foe uses to attack: spit(x, y, angle),
- * burst(x, y, count, speed) and summon(kind, x, y). The foe's velocity is
- * written back onto it; the world moves it and keeps it in the field.
- */
-export function steerEnemy(foe, dt, ctx) {
-  const player = ctx.player;
-  const dx = player.x - foe.x;
-  const dy = player.y - foe.y;
-  const dist = Math.max(1, Math.hypot(dx, dy));
-  const nx = dx / dist;
-  const ny = dy / dist;
-  foe.flash = Math.max(0, foe.flash - dt);
-
-  if (foe.kind === KIND_NIBBLER || foe.kind === KIND_MINI) {
-    const wobble = Math.sin(ctx.time * 3 + foe.phase) * 0.45;
-    const px = -ny * wobble;
-    const py = nx * wobble;
-    foe.vx = (nx + px) * foe.speed;
-    foe.vy = (ny + py) * foe.speed;
-    foe.face = Math.atan2(foe.vy, foe.vx);
-    return;
-  }
-
-  if (foe.kind === KIND_SPITTER) {
-    // Holds a ring around the player, strafing, and spits globs.
-    const want = 270;
-    const toward = dist > want + 30 ? 1 : dist < want - 30 ? -1 : 0;
-    const strafe = foe.strafeDir;
-    foe.vx = (nx * toward + -ny * strafe * 0.8) * foe.speed;
-    foe.vy = (ny * toward + nx * strafe * 0.8) * foe.speed;
-    foe.face = Math.atan2(dy, dx);
-    foe.fireTimer -= dt;
-    if (foe.fireTimer <= 0 && dist < 520) {
-      foe.fireTimer = 2.3;
-      ctx.spit(foe.x, foe.y, Math.atan2(dy, dx));
-    }
-    return;
-  }
-
-  if (foe.kind === KIND_SPLITTER) {
-    foe.vx = nx * foe.speed;
-    foe.vy = ny * foe.speed;
-    foe.face = Math.atan2(dy, dx);
-    return;
-  }
-
-  if (foe.kind === KIND_DASHER) {
-    foe.stateTimer -= dt;
-    if (foe.state === 0) {
-      // Roam: drift toward the player until close enough to strike.
-      foe.vx = nx * foe.speed;
-      foe.vy = ny * foe.speed;
-      foe.face = Math.atan2(dy, dx);
-      if (dist < 300 && foe.stateTimer <= 0) {
-        foe.state = 1;
-        foe.stateTimer = 0.5;
-      }
-    } else if (foe.state === 1) {
-      // Telegraph: nearly still, locking the lunge line. The renderer rings it.
-      foe.vx *= 0.8;
-      foe.vy *= 0.8;
-      foe.face = Math.atan2(dy, dx);
-      if (foe.stateTimer <= 0) {
-        foe.state = 2;
-        foe.stateTimer = 0.42;
-        foe.lungeX = nx;
-        foe.lungeY = ny;
-      }
-    } else if (foe.state === 2) {
-      // Lunge: fast and straight.
-      foe.vx = foe.lungeX * 540;
-      foe.vy = foe.lungeY * 540;
-      if (foe.stateTimer <= 0) {
-        foe.state = 3;
-        foe.stateTimer = 0.7;
-      }
-    } else {
-      // Recover: slow, then roam again.
-      foe.vx = nx * foe.speed * 0.4;
-      foe.vy = ny * foe.speed * 0.4;
-      if (foe.stateTimer <= 0) {
-        foe.state = 0;
-        foe.stateTimer = 0.6;
-      }
-    }
-    return;
-  }
-
-  if (foe.kind === KIND_BOSS) {
-    const enraged = foe.hp < foe.maxHp * 0.3;
-    foe.vx = nx * foe.speed * (enraged ? 1.35 : 1);
-    foe.vy = ny * foe.speed * (enraged ? 1.35 : 1);
-    foe.face = Math.atan2(dy, dx);
-    foe.fireTimer -= dt;
-    if (foe.fireTimer <= 0) {
-      foe.fireTimer = enraged ? BOSS.burstInterval * 0.65 : BOSS.burstInterval;
-      ctx.burst(foe.x, foe.y, BOSS.burstShots, enraged ? 230 : 190);
-    }
-    foe.summonTimer -= dt;
-    if (foe.summonTimer <= 0) {
-      foe.summonTimer = BOSS.spawnInterval;
-      for (let index = 0; index < BOSS.spawnBatch; index += 1) {
-        ctx.summon(KIND_NIBBLER, foe.x, foe.y);
-      }
-    }
-  }
-}
-
-/**
- * The wave director: builds each wave's roster, then hands kinds out on a
- * timer while the field has room. Boss waves open with the boss itself, then
- * a trickle of nibblers keeps the pressure on.
- */
-export function createDirector(random) {
-  let queue = [];
-  let timer = 0;
-  let wave = 0;
-  let total = 0;
-
-  function planWave(number) {
-    const kinds = [];
-    if (BOSS.waves.includes(number)) {
-      kinds.push(KIND_BOSS);
-      const trickle = 3 + Math.floor(number / 2);
-      for (let index = 0; index < trickle; index += 1) kinds.push(KIND_NIBBLER);
-      return kinds;
-    }
-    const count = WAVE.baseCount + WAVE.perWave * (number - 1);
-    for (let index = 0; index < count; index += 1) {
-      const roll = random.next();
-      if (number >= 4 && roll < 0.22) kinds.push(KIND_SPITTER);
-      else if (number >= 3 && roll < 0.42) kinds.push(KIND_SPLITTER);
-      else if (number >= 2 && roll < 0.64) kinds.push(KIND_DASHER);
-      else kinds.push(KIND_NIBBLER);
-    }
-    return kinds;
-  }
-
-  function spawnInterval() {
-    return Math.max(WAVE.minSpawnInterval, WAVE.spawnInterval * WAVE.spawnScale ** (wave - 1));
-  }
-
+export function createEnemy(kind, x, y, difficulty, rand) {
+  const def = ENEMY_TYPES[kind];
+  const r = rand ?? Math;
+  const next = typeof r.next === 'function' ? () => r.next() : () => Math.random();
   return {
-    beginWave(number) {
-      wave = number;
-      queue = planWave(number);
-      total = queue.length;
-      timer = 0.4;
-    },
-    /** The next kind to spawn this step, or null when the director waits. */
-    nextSpawn(dt, alive) {
-      if (queue.length === 0) return null;
-      if (alive >= WAVE.maxAlive && queue[0] !== KIND_BOSS) return null;
-      timer -= dt;
-      if (timer > 0) return null;
-      timer = spawnInterval();
-      return queue.shift();
-    },
-    remaining() {
-      return queue.length;
-    },
-    total() {
-      return total;
-    },
-    isBossWave() {
-      return BOSS.waves.includes(wave);
-    },
+    kind,
+    x,
+    y,
+    vx: 0,
+    vy: 0,
+    width: def.width,
+    height: def.height,
+    hp: Math.round(def.hp * difficulty.enemyHp),
+    maxHp: Math.round(def.hp * difficulty.enemyHp),
+    damage: def.damage,
+    speed: def.speed,
+    facing: next() < 0.5 ? -1 : 1,
+    attackCd: 0,
+    spitCd: 1 + next(),
+    wobble: next() * Math.PI * 2,
+    flash: 0,
+    dead: false,
+    onGround: false,
   };
 }
 
-/** A spawn point on the field's edge, at least 240px from the player. */
-export function edgeSpawn(random, player) {
-  for (let attempt = 0; attempt < 12; attempt += 1) {
-    const side = random.int(0, 3);
-    const along = random.range(40, side % 2 === 0 ? FIELD.width - 40 : FIELD.height - 40);
-    const point =
-      side === 0
-        ? { x: along, y: 30 }
-        : side === 1
-          ? { x: FIELD.width - 30, y: along }
-          : side === 2
-            ? { x: along, y: FIELD.height - 30 }
-            : { x: 30, y: along };
-    if (distance(point.x, point.y, player.x, player.y) >= 240) return point;
+function tileAtPx(world, px, py) {
+  return tileAt(world.tiles, Math.floor(px / TILE), Math.floor(py / TILE));
+}
+
+function solidAtPx(world, px, py) {
+  return isSolid(tileAtPx(world, px, py));
+}
+
+function moveWithCollision(world, e, dt, gravity) {
+  e.vy += gravity * dt;
+  const nextX = e.x + e.vx * dt;
+  const hw = e.width / 2;
+  const top = e.y - e.height + 4;
+  const bottom = e.y - 2;
+  if (e.vx > 0 && (solidAtPx(world, nextX + hw, top) || solidAtPx(world, nextX + hw, bottom) || solidAtPx(world, nextX + hw, e.y - e.height / 2))) {
+    e.x = Math.floor((nextX + hw) / TILE) * TILE - hw - 0.01;
+    e.vx = 0;
+    e.hitWall = true;
+  } else if (e.vx < 0 && (solidAtPx(world, nextX - hw, top) || solidAtPx(world, nextX - hw, bottom) || solidAtPx(world, nextX - hw, e.y - e.height / 2))) {
+    e.x = Math.floor((nextX - hw) / TILE + 1) * TILE + hw + 0.01;
+    e.vx = 0;
+    e.hitWall = true;
+  } else {
+    e.x = nextX;
+    e.hitWall = false;
   }
-  return { x: FIELD.width / 2, y: 30 };
+  const nextY = e.y + e.vy * dt;
+  e.onGround = false;
+  if (e.vy >= 0) {
+    if (solidAtPx(world, e.x - hw + 3, nextY) || solidAtPx(world, e.x + hw - 3, nextY)) {
+      e.y = Math.floor(nextY / TILE) * TILE;
+      e.vy = 0;
+      e.onGround = true;
+    } else {
+      e.y = nextY;
+    }
+  } else if (solidAtPx(world, e.x - hw + 3, nextY - e.height) || solidAtPx(world, e.x + hw - 3, nextY - e.height)) {
+    e.y = Math.floor((nextY - e.height) / TILE + 1) * TILE + e.height;
+    e.vy = 0;
+  } else {
+    e.y = nextY;
+  }
+}
+
+function damageEnemy(world, e, amount, kx, ky) {
+  e.hp -= amount;
+  e.flash = 0.12;
+  if (kx) e.vx += kx;
+  if (ky) e.vy += ky;
+  if (e.hp <= 0 && !e.dead) {
+    e.dead = true;
+    world.onEnemyKilled(e);
+  }
+}
+
+export function hurtEnemy(world, e, amount, kx, ky) {
+  damageEnemy(world, e, amount, kx, ky);
+}
+
+function updateGrub(world, e, dt) {
+  const player = world.player;
+  const dx = player.x - e.x;
+  const dy = player.y - e.y;
+  if (Math.abs(dx) < 320 && Math.abs(dy) < 120) e.facing = dx > 0 ? 1 : -1;
+  e.vx = e.facing * e.speed;
+  if (e.hitWall) e.facing *= -1;
+  // Turn at ledges so grubs patrol their floor instead of walking off.
+  const aheadX = e.x + e.facing * (e.width / 2 + 6);
+  if (e.onGround && !solidAtPx(world, aheadX, e.y + 6)) e.facing *= -1;
+  moveWithCollision(world, e, dt, 1500);
+  if (tileAtPx(world, e.x, e.y - 4) === T_LAVA) damageEnemy(world, e, 30 * dt, 0, 0);
+}
+
+function updateBat(world, e, dt) {
+  const player = world.player;
+  e.wobble += dt * 6;
+  const dx = player.x - e.x;
+  const dy = player.y - e.height / 2 - e.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  if (dist < 420) {
+    e.vx += ((dx / dist) * e.speed - e.vx) * Math.min(1, dt * 3);
+    e.vy += ((dy / dist) * e.speed * 0.8 - e.vy) * Math.min(1, dt * 3);
+  } else {
+    e.vx += Math.cos(e.wobble) * 20 * dt;
+    e.vy += Math.sin(e.wobble * 0.7) * 16 * dt;
+    e.vx *= 0.995;
+    e.vy *= 0.995;
+  }
+  const nx = e.x + e.vx * dt;
+  const ny = e.y + e.vy * dt;
+  if (!solidAtPx(world, nx, ny - e.height / 2)) {
+    e.x = nx;
+    e.y = ny;
+  } else {
+    e.vx *= -0.6;
+    e.vy *= -0.6;
+  }
+  e.facing = e.vx >= 0 ? 1 : -1;
+}
+
+function updateImp(world, e, dt) {
+  const player = world.player;
+  const dx = player.x - e.x;
+  const dy = player.y - e.y;
+  const dist = Math.hypot(dx, dy);
+  if (dist < 260 && e.onGround) {
+    e.facing = dx > 0 ? -1 : 1;
+    e.vx = e.facing * e.speed;
+  } else if (dist < 520) {
+    e.facing = dx > 0 ? 1 : -1;
+    e.vx = 0;
+  } else {
+    e.vx = e.facing * e.speed * 0.5;
+    if (e.hitWall) e.facing *= -1;
+  }
+  moveWithCollision(world, e, dt, 1500);
+  e.spitCd -= dt;
+  if (e.spitCd <= 0 && dist < 520 && Math.abs(dy) < 220) {
+    e.spitCd = 2.6;
+    const speed = 260;
+    world.spawnProjectile(e.x, e.y - e.height - 4, (dx / dist) * speed, (dy / dist) * speed - 30, 'fire', Math.round(12 * world.difficulty.enemyDamage));
+    world.audio.spit?.();
+  }
+  if (tileAtPx(world, e.x, e.y - 4) === T_LAVA) damageEnemy(world, e, 30 * dt, 0, 0);
+}
+
+function updateGolem(world, e, dt) {
+  const player = world.player;
+  const dx = player.x - e.x;
+  if (Math.abs(dx) < 480 && Math.abs(player.y - e.y) < 160) {
+    e.facing = dx > 0 ? 1 : -1;
+    e.vx = e.facing * e.speed;
+  } else {
+    e.vx = 0;
+  }
+  if (e.hitWall && e.onGround) e.vy = -520;
+  moveWithCollision(world, e, dt, 1500);
+  if (e.onGround && Math.abs(e.vx) > 1 && Math.random() < dt * 2) {
+    burst(world.particles, e.x, e.y, { count: 3, speed: 60, life: 0.4, size: 4, colors: ['#7d7a86', '#5d5a66'], gravity: 300 });
+  }
+}
+
+export function updateEnemy(world, e, dt) {
+  e.attackCd = Math.max(0, e.attackCd - dt);
+  e.flash = Math.max(0, e.flash - dt);
+  if (e.kind === 'grub') updateGrub(world, e, dt);
+  else if (e.kind === 'bat') updateBat(world, e, dt);
+  else if (e.kind === 'imp') updateImp(world, e, dt);
+  else if (e.kind === 'golem') updateGolem(world, e, dt);
+}
+
+// ---------------------------------------------------------------- boss ----
+
+export function createBoss(world) {
+  const arenaTop = rowOfLevel(30) * TILE;
+  const arenaBottom = arenaTop + 12 * TILE;
+  const boss = {
+    x: 640,
+    y: arenaTop + 200,
+    vx: 0,
+    vy: 0,
+    hp: Math.round(BOSS_HP * world.difficulty.enemyHp),
+    maxHp: Math.round(BOSS_HP * world.difficulty.enemyHp),
+    phase: 1,
+    state: 'roam',
+    timer: 2.2,
+    history: [],
+    segments: BOSS_SEGMENTS,
+    targetX: 640,
+    targetY: arenaTop + 200,
+    chargeX: 0,
+    chargeY: 0,
+    flash: 0,
+    stun: 0,
+    spitCd: 4,
+    summonCd: 8,
+    rainCd: 5,
+    arenaTop,
+    arenaBottom,
+    dead: false,
+    deathTimer: 0,
+    roarPlayed: false,
+  };
+  for (let i = 0; i < 220; i += 1) boss.history.push({ x: boss.x, y: boss.y });
+  return boss;
+}
+
+export function bossSegmentPos(boss, index) {
+  const at = Math.min(boss.history.length - 1, index * 10);
+  return boss.history[at];
+}
+
+function bossSpeed(boss) {
+  return boss.phase === 1 ? 175 : boss.phase === 2 ? 215 : 265;
+}
+
+function setPhase(world, boss, phase) {
+  boss.phase = phase;
+  boss.stun = 1.2;
+  boss.state = 'roam';
+  boss.timer = 1.4;
+  world.audio.roar();
+  burst(world.particles, boss.x, boss.y, { count: 30, speed: 300, life: 0.8, size: 7, colors: ['#ff7a3c', '#ff5252', '#ffd76a'], gravity: 200, glow: true });
+  floatText(world.particles, boss.x, boss.y - 60, phase === 2 ? 'THE WYRM RAGES!' : 'THE WYRM IS ENRAGED!', '#ff6a4d');
+  // The mountain relents for a breath: hearts scatter for the climb back.
+  for (let i = 0; i < 2; i += 1) {
+    world.pickups.push({
+      x: boss.x + (world.rand.next() - 0.5) * 260,
+      y: boss.arenaBottom - 2 * TILE,
+      vx: 0,
+      vy: -60,
+      kind: 'heart',
+      value: 1,
+      life: 25,
+    });
+  }
+}
+
+export function damageBoss(world, boss, amount) {
+  if (boss.dead) return;
+  const dealt = boss.stun > 0 ? amount * 2 : amount;
+  boss.hp -= dealt;
+  boss.flash = 0.1;
+  floatText(world.particles, boss.x + (Math.random() - 0.5) * 60, boss.y - 40, String(Math.round(dealt)), '#ffd76a');
+  const frac = boss.hp / boss.maxHp;
+  if (boss.phase === 1 && frac <= 0.66) setPhase(world, boss, 2);
+  else if (boss.phase === 2 && frac <= 0.33) setPhase(world, boss, 3);
+  if (boss.hp <= 0) {
+    boss.dead = true;
+    boss.deathTimer = 1.4;
+    world.onBossKilled();
+  }
+}
+
+function steerBoss(boss, tx, ty, dt, speed) {
+  const dx = tx - boss.x;
+  const dy = ty - boss.y;
+  const dist = Math.hypot(dx, dy) || 1;
+  const want = Math.min(dist * 4, speed);
+  boss.vx += ((dx / dist) * want - boss.vx) * Math.min(1, dt * 2.2);
+  boss.vy += ((dy / dist) * want - boss.vy) * Math.min(1, dt * 2.2);
+}
+
+export function updateBoss(world, boss, dt) {
+  boss.flash = Math.max(0, boss.flash - dt);
+  if (boss.dead) {
+    boss.deathTimer -= dt;
+    if (Math.random() < dt * 20) {
+      const seg = bossSegmentPos(boss, Math.floor(Math.random() * boss.segments));
+      burst(world.particles, seg.x, seg.y, { count: 6, speed: 200, life: 0.6, size: 6, colors: ['#ff7a3c', '#ffd76a'], gravity: 200, glow: true });
+    }
+    return;
+  }
+  const player = world.player;
+  const minX = 2 * TILE + 30;
+  const maxX = (32 - 2) * TILE - 30;
+  const minY = boss.arenaTop + 50;
+  const maxY = boss.arenaBottom - 2 * TILE - 20;
+
+  if (boss.stun > 0) {
+    boss.stun -= dt;
+    boss.vx *= 0.9;
+    boss.vy *= 0.9;
+  } else if (boss.state === 'roam') {
+    boss.timer -= dt;
+    const wobble = Math.sin(world.time * 2.2) * 60;
+    steerBoss(boss, boss.targetX + wobble * 0.4, boss.targetY + wobble * 0.3, dt, bossSpeed(boss));
+    if (Math.hypot(boss.targetX - boss.x, boss.targetY - boss.y) < 50 || boss.timer <= 0) {
+      const rand = world.rand;
+      boss.targetX = Math.max(minX, Math.min(maxX, player.x + (rand.next() - 0.5) * 320));
+      boss.targetY = Math.max(minY, Math.min(maxY, player.y - 60 + (rand.next() - 0.5) * 200));
+      boss.timer = 1.6 + rand.next() * 1.4;
+      if (rand.next() < 0.55) {
+        boss.state = 'windup';
+        boss.timer = 0.7;
+        boss.vx *= 0.3;
+        boss.vy *= 0.3;
+      }
+    }
+    boss.spitCd -= dt;
+    if (boss.phase >= 2 && boss.spitCd <= 0) {
+      boss.spitCd = boss.phase === 2 ? 5.5 : 4;
+      boss.state = 'spit';
+      boss.timer = 0.9;
+      boss.spitDone = false;
+    }
+    boss.summonCd -= dt;
+    if (boss.phase === 2 && boss.summonCd <= 0) {
+      boss.summonCd = 11;
+      world.spawnBossAdds();
+    }
+    boss.rainCd -= dt;
+    if (boss.phase === 3 && boss.rainCd <= 0) {
+      boss.rainCd = 4.5;
+      world.spawnRockRain();
+    }
+  } else if (boss.state === 'windup') {
+    boss.timer -= dt;
+    boss.vx *= 0.85;
+    boss.vy *= 0.85;
+    boss.chargeX = player.x;
+    boss.chargeY = player.y - 18;
+    if (boss.timer <= 0) {
+      boss.state = 'charge';
+      boss.timer = 0.85;
+      const dx = boss.chargeX - boss.x;
+      const dy = boss.chargeY - boss.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      boss.vx = (dx / dist) * 540;
+      boss.vy = (dy / dist) * 540;
+      world.audio.roar();
+    }
+  } else if (boss.state === 'charge') {
+    boss.timer -= dt;
+    burst(world.particles, boss.x, boss.y, { count: 2, speed: 80, life: 0.4, size: 5, colors: ['#7d7a86', '#9a97a3'], gravity: 100 });
+    if (boss.timer <= 0 || boss.x < minX || boss.x > maxX || boss.y < minY || boss.y > maxY) {
+      boss.state = 'roam';
+      boss.timer = 1.2;
+      boss.vx *= 0.25;
+      boss.vy *= 0.25;
+    }
+  } else if (boss.state === 'spit') {
+    boss.timer -= dt;
+    boss.vx *= 0.85;
+    boss.vy *= 0.85;
+    if (!boss.spitDone && boss.timer <= 0.55) {
+      boss.spitDone = true;
+      const dx = player.x - boss.x;
+      const dy = player.y - 18 - boss.y;
+      const dist = Math.hypot(dx, dy) || 1;
+      for (let i = -1; i <= 1; i += 1) {
+        const angle = Math.atan2(dy, dx) + i * 0.22;
+        world.spawnProjectile(boss.x, boss.y, Math.cos(angle) * 250, Math.sin(angle) * 250, 'glob', Math.round(12 * world.difficulty.enemyDamage));
+      }
+    }
+    if (boss.timer <= 0) {
+      boss.state = 'roam';
+      boss.timer = 1.4;
+    }
+  }
+
+  boss.x += boss.vx * dt;
+  boss.y += boss.vy * dt;
+  boss.x = Math.max(minX, Math.min(maxX, boss.x));
+  boss.y = Math.max(minY, Math.min(maxY, boss.y));
+  boss.history.unshift({ x: boss.x, y: boss.y });
+  if (boss.history.length > 220) boss.history.pop();
+
+  // Contact damage against the player.
+  if (player.iframe <= 0) {
+    const headDist = Math.hypot(player.x - boss.x, player.y - 18 - boss.y);
+    let hit = headDist < 52;
+    if (!hit) {
+      for (let i = 1; i < boss.segments; i += 1) {
+        const seg = bossSegmentPos(boss, i);
+        if (Math.hypot(player.x - seg.x, player.y - 18 - seg.y) < 40) {
+          hit = true;
+          break;
+        }
+      }
+    }
+    if (hit) world.damagePlayer(Math.round(20 * world.difficulty.enemyDamage), Math.sign(player.x - boss.x) * 320, -260);
+  }
 }

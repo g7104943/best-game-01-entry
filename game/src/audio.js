@@ -1,188 +1,197 @@
-// Every sound in Lumen Reef, synthesised live with WebAudio: no audio files,
-// no network, nothing to load. Short blips and sweeps for actions, a soft
-// generative pad for music. Everything no-ops until the first gesture unlocks
-// the context, and every call is guarded, so a browser without audio still
-// plays the game.
-
-const NOTE_NAMES = [0, 3, 5, 7, 10, 12, 15];
-const BASE_FREQ = 220;
-
-function noteFrequency(step) {
-  return BASE_FREQ * 2 ** (step / 12);
-}
-
-export function createAudio(startMuted) {
-  let context = null;
-  let master = null;
-  let musicGain = null;
-  let muted = startMuted;
-  let unlocked = false;
-  let musicTimer = null;
-  let musicStep = 0;
-  let lastShotAt = 0;
+// All sound is synthesized with WebAudio: no assets, no files. Short effects
+// are oscillators and filtered noise; the music is a small step sequencer
+// whose intensity follows the depth and the boss fight. The context starts on
+// the first user gesture, and M toggles mute.
+export function createAudio() {
+  const audio = {
+    ctx: null,
+    master: null,
+    musicGain: null,
+    muted: false,
+    musicTimer: null,
+    step: 0,
+    intensity: 0,
+    started: false,
+  };
 
   function ensure() {
-    if (context !== null) return true;
+    if (audio.ctx) return true;
     try {
-      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-      if (!AudioContextClass) return false;
-      context = new AudioContextClass();
-      master = context.createGain();
-      master.gain.value = muted ? 0 : 0.9;
-      master.connect(context.destination);
-      musicGain = context.createGain();
-      musicGain.gain.value = 0.16;
-      musicGain.connect(master);
+      const Ctx = window.AudioContext || window.webkitAudioContext;
+      audio.ctx = new Ctx();
+      audio.master = audio.ctx.createGain();
+      audio.master.gain.value = audio.muted ? 0 : 0.5;
+      audio.master.connect(audio.ctx.destination);
+      audio.musicGain = audio.ctx.createGain();
+      audio.musicGain.gain.value = 0.16;
+      audio.musicGain.connect(audio.master);
+      return true;
     } catch {
-      context = null;
       return false;
     }
-    return true;
   }
 
-  /** Call from a user gesture: starts the context and the music. */
-  function unlock() {
+  function tone(freq, dur, type, vol, slideTo, when) {
     if (!ensure()) return;
-    if (context.state === 'suspended') context.resume().catch(() => {});
-    if (!unlocked) {
-      unlocked = true;
-      startMusic();
-    }
+    const t = audio.ctx.currentTime + (when ?? 0);
+    const osc = audio.ctx.createOscillator();
+    const gain = audio.ctx.createGain();
+    osc.type = type ?? 'square';
+    osc.frequency.setValueAtTime(freq, t);
+    if (slideTo) osc.frequency.exponentialRampToValueAtTime(Math.max(20, slideTo), t + dur);
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    osc.connect(gain);
+    gain.connect(audio.master);
+    osc.start(t);
+    osc.stop(t + dur + 0.02);
   }
 
-  function tone({ freq, end = null, duration, type = 'sine', gain = 0.2, delay = 0, music = false }) {
-    if (context === null || muted) return;
-    try {
-      const at = context.currentTime + delay;
-      const oscillator = context.createOscillator();
-      const envelope = context.createGain();
-      oscillator.type = type;
-      oscillator.frequency.setValueAtTime(freq, at);
-      if (end !== null) oscillator.frequency.exponentialRampToValueAtTime(Math.max(20, end), at + duration);
-      envelope.gain.setValueAtTime(0, at);
-      envelope.gain.linearRampToValueAtTime(gain, at + 0.008);
-      envelope.gain.exponentialRampToValueAtTime(0.0001, at + duration);
-      oscillator.connect(envelope);
-      envelope.connect(music ? musicGain : master);
-      oscillator.start(at);
-      oscillator.stop(at + duration + 0.05);
-    } catch {
-      // A failed blip never stops the game.
-    }
+  function noise(dur, vol, filterFreq, type) {
+    if (!ensure()) return;
+    const t = audio.ctx.currentTime;
+    const len = Math.floor(audio.ctx.sampleRate * dur);
+    const buffer = audio.ctx.createBuffer(1, len, audio.ctx.sampleRate);
+    const data = buffer.getChannelData(0);
+    for (let i = 0; i < len; i += 1) data[i] = (Math.random() * 2 - 1) * (1 - i / len);
+    const src = audio.ctx.createBufferSource();
+    src.buffer = buffer;
+    const filter = audio.ctx.createBiquadFilter();
+    filter.type = type ?? 'lowpass';
+    filter.frequency.value = filterFreq;
+    const gain = audio.ctx.createGain();
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.001, t + dur);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(audio.master);
+    src.start(t);
   }
 
-  function noise({ duration, gain = 0.15, frequency = 1200, delay = 0 }) {
-    if (context === null || muted) return;
-    try {
-      const at = context.currentTime + delay;
-      const length = Math.max(1, Math.floor(context.sampleRate * duration));
-      const buffer = context.createBuffer(1, length, context.sampleRate);
-      const data = buffer.getChannelData(0);
-      for (let index = 0; index < length; index += 1) data[index] = Math.random() * 2 - 1;
-      const source = context.createBufferSource();
-      source.buffer = buffer;
-      const filter = context.createBiquadFilter();
-      filter.type = 'lowpass';
-      filter.frequency.value = frequency;
-      const envelope = context.createGain();
-      envelope.gain.setValueAtTime(gain, at);
-      envelope.gain.exponentialRampToValueAtTime(0.0001, at + duration);
-      source.connect(filter);
-      filter.connect(envelope);
-      envelope.connect(master);
-      source.start(at);
-    } catch {
-      // A failed whoosh never stops the game.
-    }
-  }
+  const BASS = [55, 55, 65.41, 49, 55, 55, 73.42, 65.41];
+  const ARPS = [
+    [220, 261.63, 329.63, 261.63],
+    [220, 261.63, 329.63, 392],
+    [246.94, 293.66, 369.99, 293.66],
+    [196, 246.94, 293.66, 246.94],
+  ];
 
-  /** A slow underwater drift: a soft chord, then sparse pentatonic notes. */
-  function startMusic() {
-    if (musicTimer !== null || context === null) return;
-    musicTimer = setInterval(() => {
-      if (muted || context.state !== 'running') return;
-      const step = NOTE_NAMES[musicStep % NOTE_NAMES.length];
-      tone({ freq: noteFrequency(step), duration: 1.6, type: 'sine', gain: 0.12, music: true });
-      if (musicStep % 4 === 0) {
-        tone({ freq: noteFrequency(step) / 2, duration: 3.2, type: 'triangle', gain: 0.1, music: true });
-        tone({ freq: noteFrequency(step + 7) / 2, duration: 3.2, type: 'sine', gain: 0.07, music: true });
-      }
-      musicStep += 1;
-    }, 900);
-  }
-
-  function stopMusic() {
-    if (musicTimer !== null) {
-      clearInterval(musicTimer);
-      musicTimer = null;
+  function musicStep() {
+    if (!audio.ctx || audio.muted) return;
+    const bar = Math.floor(audio.step / 4) % BASS.length;
+    const beat = audio.step % 4;
+    const t = audio.ctx.currentTime;
+    const bass = audio.ctx.createOscillator();
+    const bassGain = audio.ctx.createGain();
+    bass.type = 'triangle';
+    bass.frequency.value = BASS[bar];
+    bassGain.gain.setValueAtTime(0.5, t);
+    bassGain.gain.exponentialRampToValueAtTime(0.001, t + 0.32);
+    bass.connect(bassGain);
+    bassGain.connect(audio.musicGain);
+    bass.start(t);
+    bass.stop(t + 0.34);
+    if (audio.intensity > 0.25) {
+      const arp = audio.ctx.createOscillator();
+      const arpGain = audio.ctx.createGain();
+      arp.type = 'sine';
+      arp.frequency.value = ARPS[bar % ARPS.length][beat];
+      arpGain.gain.setValueAtTime(0.22 + audio.intensity * 0.2, t);
+      arpGain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+      arp.connect(arpGain);
+      arpGain.connect(audio.musicGain);
+      arp.start(t);
+      arp.stop(t + 0.24);
     }
+    if (audio.intensity > 0.7 && beat === 2) {
+      const hat = audio.ctx.createOscillator();
+      const hatGain = audio.ctx.createGain();
+      hat.type = 'square';
+      hat.frequency.value = 1200;
+      hatGain.gain.setValueAtTime(0.05, t);
+      hatGain.gain.exponentialRampToValueAtTime(0.001, t + 0.05);
+      hat.connect(hatGain);
+      hatGain.connect(audio.musicGain);
+      hat.start(t);
+      hat.stop(t + 0.06);
+    }
+    audio.step += 1;
   }
 
   return {
-    unlock,
-    stopMusic,
-    isMuted() {
-      return muted;
+    unlock() {
+      if (ensure() && audio.ctx.state === 'suspended') audio.ctx.resume();
+      if (!audio.started) {
+        audio.started = true;
+        audio.musicTimer = setInterval(musicStep, 240);
+      }
     },
-    setMuted(value) {
-      muted = value;
-      if (master !== null && context !== null) master.gain.value = muted ? 0 : 0.9;
+    setIntensity(v) {
+      audio.intensity = Math.max(0, Math.min(1, v));
     },
-    shoot() {
-      if (context === null) return;
-      const now = context.currentTime;
-      if (now - lastShotAt < 0.05) return;
-      lastShotAt = now;
-      tone({ freq: 920, end: 540, duration: 0.07, type: 'triangle', gain: 0.1 });
+    toggleMute() {
+      audio.muted = !audio.muted;
+      if (audio.master) audio.master.gain.value = audio.muted ? 0 : 0.5;
+      return audio.muted;
     },
-    hit() {
-      tone({ freq: 240, end: 120, duration: 0.08, type: 'square', gain: 0.08 });
+    get mutedNow() {
+      return audio.muted;
     },
-    die(big) {
-      tone({ freq: big ? 300 : 520, end: 90, duration: big ? 0.5 : 0.22, type: 'sawtooth', gain: 0.12 });
-      noise({ duration: big ? 0.4 : 0.15, gain: 0.12, frequency: 900 });
+    dig() {
+      noise(0.07, 0.25, 900, 'lowpass');
     },
-    pickup(combo) {
-      const step = Math.min(combo, 12);
-      tone({ freq: noteFrequency(12 + step), duration: 0.14, type: 'sine', gain: 0.16 });
-      tone({ freq: noteFrequency(19 + step), duration: 0.18, type: 'sine', gain: 0.08, delay: 0.04 });
+    breakTile() {
+      noise(0.16, 0.4, 1400, 'lowpass');
+      tone(140, 0.12, 'triangle', 0.2, 60);
     },
-    levelUp() {
-      [0, 4, 7, 12].forEach((step, index) => {
-        tone({ freq: noteFrequency(12 + step), duration: 0.3, type: 'triangle', gain: 0.16, delay: index * 0.09 });
-      });
+    pickup() {
+      tone(880, 0.09, 'sine', 0.25, 1320);
+    },
+    gem() {
+      tone(1174, 0.1, 'sine', 0.25, 1760);
+      tone(1760, 0.14, 'sine', 0.18, 2349, 0.07);
     },
     hurt() {
-      tone({ freq: 160, end: 50, duration: 0.25, type: 'sawtooth', gain: 0.2 });
-      noise({ duration: 0.2, gain: 0.14, frequency: 500 });
+      tone(220, 0.18, 'sawtooth', 0.3, 90);
+      noise(0.1, 0.2, 500, 'lowpass');
     },
-    dash() {
-      noise({ duration: 0.18, gain: 0.1, frequency: 2600 });
+    explosion() {
+      noise(0.5, 0.55, 300, 'lowpass');
+      tone(90, 0.4, 'sine', 0.5, 35);
     },
-    bossRoar() {
-      tone({ freq: 90, end: 55, duration: 1.1, type: 'sawtooth', gain: 0.22 });
-      tone({ freq: 135, end: 80, duration: 1.1, type: 'square', gain: 0.08, delay: 0.1 });
+    bombPlace() {
+      tone(320, 0.08, 'square', 0.2, 200);
     },
-    waveStart() {
-      tone({ freq: noteFrequency(7), duration: 0.25, type: 'triangle', gain: 0.12 });
-      tone({ freq: noteFrequency(12), duration: 0.35, type: 'triangle', gain: 0.12, delay: 0.12 });
+    enemyDie() {
+      tone(330, 0.15, 'square', 0.22, 70);
     },
-    choose() {
-      tone({ freq: noteFrequency(12), duration: 0.16, type: 'triangle', gain: 0.16 });
-      tone({ freq: noteFrequency(16), duration: 0.22, type: 'triangle', gain: 0.14, delay: 0.07 });
+    spit() {
+      tone(500, 0.12, 'sawtooth', 0.15, 180);
+    },
+    draft() {
+      tone(523, 0.12, 'sine', 0.25);
+      tone(659, 0.12, 'sine', 0.25, 0, 0.1);
+      tone(784, 0.2, 'sine', 0.25, 0, 0.2);
+    },
+    pick() {
+      tone(784, 0.1, 'sine', 0.28, 1046);
+      tone(1046, 0.16, 'sine', 0.22, 0, 0.08);
     },
     click() {
-      tone({ freq: 700, duration: 0.06, type: 'sine', gain: 0.1 });
+      tone(660, 0.05, 'square', 0.12);
+    },
+    roar() {
+      tone(70, 0.7, 'sawtooth', 0.4, 45);
+      noise(0.6, 0.3, 250, 'lowpass');
     },
     victory() {
-      [0, 4, 7, 12, 16, 19, 24].forEach((step, index) => {
-        tone({ freq: noteFrequency(12 + step), duration: 0.4, type: 'triangle', gain: 0.16, delay: index * 0.11 });
-      });
+      [523, 659, 784, 1046, 784, 1046, 1318].forEach((f, i) => tone(f, 0.22, 'sine', 0.28, 0, i * 0.13));
     },
-    gameOver() {
-      [12, 10, 7, 3, 0].forEach((step, index) => {
-        tone({ freq: noteFrequency(step), duration: 0.42, type: 'triangle', gain: 0.14, delay: index * 0.16 });
-      });
+    defeat() {
+      [392, 370, 349, 311].forEach((f, i) => tone(f, 0.35, 'triangle', 0.25, 0, i * 0.22));
+    },
+    levelUp() {
+      tone(587, 0.1, 'sine', 0.25, 880);
     },
   };
 }

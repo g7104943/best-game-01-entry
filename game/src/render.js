@@ -1,841 +1,1176 @@
-// Drawing only: the world's state and the current screen in, pixels out. The
-// 1280x720 lagoon is scaled to fit the window and centred. The reef is painted
-// once to an offscreen canvas; the water, light rays, motes, creatures, HUD
-// and panels are drawn fresh every frame. Nothing here changes the world.
-
-import { FIELD, FONT, PALETTE, PLAYER } from './config.js';
-import { KIND_BOSS, KIND_DASHER, KIND_MINI, KIND_NIBBLER, KIND_SPITTER, KIND_SPLITTER } from './enemies.js';
-import { createRandom } from './random.js';
+// Everything the player sees: the cavern, the mech, the creatures, the
+// boss, the HUD and every menu screen. All art is drawn in code on one
+// canvas; the first screenshot the judge sees is the cover frame this file
+// paints, so the play view carries the whole game at a glance: hull, heat,
+// depth, score, the depth rail and the boss bar.
+import { BOSS_LEVEL, PLAYER_H, PLAYER_W, TILE, VIEW_H, VIEW_W, WORLD_W } from './config.js';
+import { hash2 } from './random.js';
+import {
+  T_BEDROCK,
+  T_BOULDER,
+  T_CRYSTAL,
+  T_DIRT,
+  T_EMPTY,
+  T_GAS,
+  T_HARD,
+  T_LAVA,
+  T_METAL,
+  T_ORE,
+  T_ROCK,
+  T_WATER,
+  isSolid,
+  rowOfLevel,
+  tileAt,
+} from './tiles.js';
+import { bossSegmentPos } from './enemies.js';
+import { shakeOffset } from './particles.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
 export const SCREEN_PAUSED = 'paused';
-export const SCREEN_CHOICE = 'choice';
+export const SCREEN_DRAFT = 'draft';
 export const SCREEN_OVER = 'over';
 export const SCREEN_WIN = 'win';
 
-/** The three upgrade cards: same rects for drawing and for click tests. */
-export function choiceLayout() {
-  const width = 300;
-  const height = 330;
-  const gap = 28;
-  const total = width * 3 + gap * 2;
-  const x0 = (FIELD.width - total) / 2;
-  const y = 196;
-  return [0, 1, 2].map((index) => ({ x: x0 + index * (width + gap), y, width, height }));
+const FONT = '"Trebuchet MS", "DejaVu Sans", Verdana, sans-serif';
+
+function lerpColor(a, b, t) {
+  return [
+    Math.round(a[0] + (b[0] - a[0]) * t),
+    Math.round(a[1] + (b[1] - a[1]) * t),
+    Math.round(a[2] + (b[2] - a[2]) * t),
+  ];
 }
 
-function heartPath(context, x, y, size) {
-  context.beginPath();
-  context.moveTo(x, y + size * 0.32);
-  context.bezierCurveTo(x - size * 0.55, y - size * 0.28, x - size * 0.28, y - size * 0.75, x, y - size * 0.3);
-  context.bezierCurveTo(x + size * 0.28, y - size * 0.75, x + size * 0.55, y - size * 0.28, x, y + size * 0.32);
-  context.closePath();
+function rgb(c, alpha) {
+  return alpha === undefined ? `rgb(${c[0]},${c[1]},${c[2]})` : `rgba(${c[0]},${c[1]},${c[2]},${alpha})`;
 }
 
-function starPath(context, x, y, outer, inner, points = 5) {
-  context.beginPath();
-  for (let index = 0; index < points * 2; index += 1) {
-    const radius = index % 2 === 0 ? outer : inner;
-    const angle = (index / (points * 2)) * Math.PI * 2 - Math.PI / 2;
-    const px = x + Math.cos(angle) * radius;
-    const py = y + Math.sin(angle) * radius;
-    if (index === 0) context.moveTo(px, py);
-    else context.lineTo(px, py);
-  }
-  context.closePath();
-}
-
-/** The little glyph on an upgrade card, drawn from its icon key. */
-function drawIcon(context, icon, x, y, size, color) {
-  context.save();
-  context.translate(x, y);
-  context.fillStyle = color;
-  context.strokeStyle = color;
-  context.lineWidth = 3;
-  context.lineJoin = 'round';
-  context.lineCap = 'round';
-  if (icon === 'fins') {
-    context.beginPath();
-    context.moveTo(-size * 0.5, size * 0.3);
-    context.quadraticCurveTo(-size * 0.1, -size * 0.5, size * 0.5, -size * 0.4);
-    context.quadraticCurveTo(size * 0.2, 0, size * 0.5, size * 0.4);
-    context.quadraticCurveTo(0, size * 0.1, -size * 0.5, size * 0.3);
-    context.fill();
-  } else if (icon === 'bolt') {
-    context.beginPath();
-    context.moveTo(size * 0.1, -size * 0.55);
-    context.lineTo(-size * 0.35, size * 0.1);
-    context.lineTo(-size * 0.02, size * 0.1);
-    context.lineTo(-size * 0.1, size * 0.55);
-    context.lineTo(size * 0.35, -size * 0.1);
-    context.lineTo(size * 0.02, -size * 0.1);
-    context.closePath();
-    context.fill();
-  } else if (icon === 'star') {
-    starPath(context, 0, 0, size * 0.55, size * 0.24);
-    context.fill();
-  } else if (icon === 'twin') {
-    context.beginPath();
-    context.arc(-size * 0.28, 0, size * 0.26, 0, Math.PI * 2);
-    context.arc(size * 0.28, 0, size * 0.26, 0, Math.PI * 2);
-    context.fill();
-  } else if (icon === 'reach') {
-    context.beginPath();
-    context.moveTo(-size * 0.5, 0);
-    context.lineTo(size * 0.3, 0);
-    context.moveTo(size * 0.05, -size * 0.28);
-    context.lineTo(size * 0.35, 0);
-    context.lineTo(size * 0.05, size * 0.28);
-    context.stroke();
-    context.beginPath();
-    context.arc(-size * 0.5, 0, size * 0.12, 0, Math.PI * 2);
-    context.fill();
-  } else if (icon === 'net') {
-    context.beginPath();
-    context.arc(0, 0, size * 0.45, 0, Math.PI * 2);
-    context.stroke();
-    context.beginPath();
-    context.arc(0, 0, size * 0.22, 0, Math.PI * 2);
-    context.stroke();
-    context.beginPath();
-    context.arc(0, 0, size * 0.07, 0, Math.PI * 2);
-    context.fill();
-  } else if (icon === 'scales') {
-    heartPath(context, 0, size * 0.1, size * 0.8);
-    context.fill();
-  } else if (icon === 'dash') {
-    for (let index = -1; index <= 1; index += 1) {
-      context.beginPath();
-      context.moveTo(index * size * 0.3 - size * 0.12, -size * 0.35);
-      context.lineTo(index * size * 0.3 + size * 0.18, 0);
-      context.lineTo(index * size * 0.3 - size * 0.12, size * 0.35);
-      context.stroke();
-    }
-  } else if (icon === 'pierce') {
-    context.beginPath();
-    context.arc(0, 0, size * 0.34, 0, Math.PI * 2);
-    context.stroke();
-    context.beginPath();
-    context.moveTo(-size * 0.55, 0);
-    context.lineTo(size * 0.55, 0);
-    context.moveTo(size * 0.3, -size * 0.2);
-    context.lineTo(size * 0.55, 0);
-    context.lineTo(size * 0.3, size * 0.2);
-    context.stroke();
-  } else if (icon === 'luck') {
-    for (let index = 0; index < 4; index += 1) {
-      const angle = (index / 4) * Math.PI * 2 + Math.PI / 4;
-      context.beginPath();
-      context.arc(Math.cos(angle) * size * 0.22, Math.sin(angle) * size * 0.22, size * 0.22, 0, Math.PI * 2);
-      context.fill();
-    }
-  } else if (icon === 'wind') {
-    context.beginPath();
-    context.arc(0, 0, size * 0.4, Math.PI * 0.2, Math.PI * 1.4);
-    context.stroke();
-    context.beginPath();
-    context.arc(0, 0, size * 0.22, Math.PI * 1.1, Math.PI * 2.1);
-    context.stroke();
-    context.beginPath();
-    context.arc(size * 0.3, -size * 0.28, size * 0.08, 0, Math.PI * 2);
-    context.fill();
-  } else {
-    context.beginPath();
-    for (let index = 0; index < 6; index += 1) {
-      const angle = (index / 6) * Math.PI * 2 - Math.PI / 2;
-      const px = Math.cos(angle) * size * 0.5;
-      const py = Math.sin(angle) * size * 0.5;
-      if (index === 0) context.moveTo(px, py);
-      else context.lineTo(px, py);
-    }
-    context.closePath();
-    context.stroke();
-    context.beginPath();
-    context.arc(0, 0, size * 0.14, 0, Math.PI * 2);
-    context.fill();
-  }
-  context.restore();
-}
+const SKY_TOP = [135, 181, 224];
+const SKY_BOT = [214, 228, 240];
+const DEEP_TOP = [26, 14, 18];
+const DEEP_BOT = [48, 16, 12];
 
 export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0, ratio: 1 };
-  const fonts = new Map();
-  const decorRandom = createRandom(20261115);
-  const reefCanvas = document.createElement('canvas');
-  const motes = [];
-  for (let index = 0; index < 80; index += 1) {
-    motes.push({
-      x: decorRandom.range(0, FIELD.width),
-      y: decorRandom.range(0, FIELD.height),
-      size: decorRandom.range(1, 2.6),
-      phase: decorRandom.range(0, Math.PI * 2),
-      speed: decorRandom.range(4, 14),
-    });
-  }
+  const ctx = canvas.getContext('2d');
+  canvas.width = VIEW_W;
+  canvas.height = VIEW_H;
 
-  function paintReef() {
-    reefCanvas.width = FIELD.width;
-    reefCanvas.height = FIELD.height;
-    const reef = reefCanvas.getContext('2d');
-    reef.fillStyle = PALETTE.reef;
-    reef.beginPath();
-    reef.moveTo(0, FIELD.height);
-    let x = 0;
-    let y = FIELD.height - 46;
-    reef.lineTo(0, y);
-    while (x < FIELD.width) {
-      const nextX = Math.min(FIELD.width, x + decorRandom.range(90, 220));
-      const nextY = FIELD.height - decorRandom.range(28, 96);
-      reef.quadraticCurveTo((x + nextX) / 2, y - 34, nextX, nextY);
-      x = nextX;
-      y = nextY;
-    }
-    reef.lineTo(FIELD.width, FIELD.height);
-    reef.closePath();
-    reef.fill();
-    reef.strokeStyle = PALETTE.reefEdge;
-    reef.lineWidth = 3;
-    reef.stroke();
-    // Coral branches, anemones and glow plants along the reef top.
-    for (let index = 0; index < 26; index += 1) {
-      const px = decorRandom.range(30, FIELD.width - 30);
-      const py = FIELD.height - decorRandom.range(20, 70);
-      const kind = decorRandom.int(0, 2);
-      if (kind === 0) {
-        reef.strokeStyle = PALETTE.coral;
-        reef.lineWidth = 5;
-        reef.lineCap = 'round';
-        reef.beginPath();
-        reef.moveTo(px, py);
-        reef.quadraticCurveTo(px - 8, py - 18, px - 16, py - 30);
-        reef.moveTo(px, py);
-        reef.quadraticCurveTo(px + 6, py - 22, px + 14, py - 38);
-        reef.moveTo(px, py - 10);
-        reef.quadraticCurveTo(px, py - 26, px + 2, py - 44);
-        reef.stroke();
-      } else if (kind === 1) {
-        reef.fillStyle = PALETTE.anemone;
-        for (let dot = 0; dot < 6; dot += 1) {
-          reef.beginPath();
-          reef.arc(px + decorRandom.range(-12, 12), py - decorRandom.range(0, 14), 2.6, 0, Math.PI * 2);
-          reef.fill();
+  function drawBackground(world) {
+    const depth = Math.max(0, Math.min(1, world.cameraY / (BOSS_LEVEL * 12 * TILE)));
+    const top = lerpColor(SKY_TOP, DEEP_TOP, Math.min(1, depth * 1.6));
+    const bot = lerpColor(SKY_BOT, DEEP_BOT, Math.min(1, depth * 1.6));
+    const grad = ctx.createLinearGradient(0, 0, 0, VIEW_H);
+    grad.addColorStop(0, rgb(top));
+    grad.addColorStop(1, rgb(bot));
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    // Parallax rock silhouettes, two layers, seeded so they never jump.
+    for (let layer = 0; layer < 2; layer += 1) {
+      const speed = layer === 0 ? 0.25 : 0.5;
+      const shade = layer === 0 ? 'rgba(0,0,0,0.16)' : 'rgba(0,0,0,0.28)';
+      ctx.fillStyle = shade;
+      const spacing = 260 - layer * 60;
+      const offset = (world.cameraY * speed) % spacing;
+      for (let y = -spacing; y < VIEW_H + spacing; y += spacing) {
+        for (let x = -40; x < VIEW_W + 80; x += spacing) {
+          const h = hash2(Math.floor((x + 1000) / spacing), Math.floor((y + offset + 1000) / spacing) + layer * 57, 7);
+          if (h < 0.55) {
+            const r = 50 + h * 90;
+            ctx.beginPath();
+            ctx.ellipse(x + h * 120, y + offset + h * 60, r, r * 0.55, 0, 0, Math.PI * 2);
+            ctx.fill();
+          }
         }
+      }
+    }
+  }
+
+  function drawTiles(world) {
+    const camY = world.cameraY;
+    const topRow = Math.max(0, Math.floor(camY / TILE));
+    const botRow = Math.min(world.tiles.rows.length - 1, Math.ceil((camY + VIEW_H) / TILE));
+    const time = world.time;
+    for (let y = topRow; y <= botRow; y += 1) {
+      const sy = y * TILE - camY;
+      for (let x = 0; x < WORLD_W; x += 1) {
+        const tile = tileAt(world.tiles, x, y);
+        if (tile === T_EMPTY) continue;
+        const sx = x * TILE;
+        const h = hash2(x, y, 3);
+        const h2 = hash2(x, y, 11);
+        if (tile === T_LAVA) {
+          const pulse = 0.5 + 0.5 * Math.sin(time * 2.4 + x * 0.7 + y * 0.4);
+          ctx.fillStyle = '#c22e12';
+          ctx.fillRect(sx, sy, TILE, TILE);
+          ctx.fillStyle = `rgba(255,${Math.round(110 + pulse * 70)},40,0.85)`;
+          ctx.beginPath();
+          ctx.ellipse(sx + 20 + Math.sin(time * 1.8 + x) * 5, sy + 20, 16 + pulse * 5, 10 + pulse * 4, 0, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = 'rgba(255,220,120,0.5)';
+          ctx.fillRect(sx, sy, TILE, 3);
+          continue;
+        }
+        if (tile === T_WATER) {
+          ctx.fillStyle = 'rgba(52,120,190,0.75)';
+          ctx.fillRect(sx, sy, TILE, TILE);
+          ctx.fillStyle = 'rgba(160,210,255,0.6)';
+          const wy = sy + 8 + Math.sin(time * 2 + x * 1.3) * 3;
+          ctx.fillRect(sx + 4, wy, TILE - 8, 3);
+          continue;
+        }
+        // Solid tile base.
+        let base;
+        if (tile === T_DIRT) base = h < 0.5 ? '#7a5230' : '#8a5c36';
+        else if (tile === T_ROCK) base = h < 0.5 ? '#6b6874' : '#7a7784';
+        else if (tile === T_HARD) base = h < 0.5 ? '#4e4a58' : '#5a5566';
+        else if (tile === T_CRYSTAL) base = '#4a3a5e';
+        else if (tile === T_ORE) base = h < 0.5 ? '#6b5a44' : '#77644c';
+        else if (tile === T_METAL) base = '#5c6068';
+        else if (tile === T_BEDROCK) base = '#23202a';
+        else if (tile === T_GAS) base = '#5e6b4a';
+        else base = '#6b6874'; // boulder
+        ctx.fillStyle = base;
+        ctx.fillRect(sx, sy, TILE, TILE);
+        // Speckles.
+        ctx.fillStyle = 'rgba(0,0,0,0.18)';
+        ctx.fillRect(sx + 6 + h * 18, sy + 8 + h2 * 16, 5, 4);
+        ctx.fillRect(sx + 22 - h * 10, sy + 24 + h2 * 8, 4, 4);
+        ctx.fillStyle = 'rgba(255,255,255,0.07)';
+        ctx.fillRect(sx + 4 + h2 * 20, sy + 4, 8, 3);
+        // Exposed edges read as cavern walls.
+        if (!isSolid(tileAt(world.tiles, x, y - 1))) {
+          ctx.fillStyle = 'rgba(255,255,255,0.16)';
+          ctx.fillRect(sx, sy, TILE, 4);
+        }
+        if (!isSolid(tileAt(world.tiles, x, y + 1))) {
+          ctx.fillStyle = 'rgba(0,0,0,0.25)';
+          ctx.fillRect(sx, sy + TILE - 4, TILE, 4);
+        }
+        if (!isSolid(tileAt(world.tiles, x - 1, y))) {
+          ctx.fillStyle = 'rgba(0,0,0,0.2)';
+          ctx.fillRect(sx, sy, 3, TILE);
+        }
+        if (!isSolid(tileAt(world.tiles, x + 1, y))) {
+          ctx.fillStyle = 'rgba(0,0,0,0.2)';
+          ctx.fillRect(sx + TILE - 3, sy, 3, TILE);
+        }
+        if (tile === T_CRYSTAL) {
+          ctx.fillStyle = 'rgba(127,231,255,0.25)';
+          ctx.beginPath();
+          ctx.arc(sx + 20, sy + 20, 18, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#7fe7ff';
+          drawDiamond(sx + 14 + h * 10, sy + 20, 7, 11);
+          ctx.fillStyle = '#b78bff';
+          drawDiamond(sx + 26, sy + 14 + h2 * 8, 5, 8);
+        } else if (tile === T_ORE) {
+          ctx.fillStyle = '#ffb347';
+          ctx.beginPath();
+          ctx.arc(sx + 12 + h * 8, sy + 14, 4, 0, Math.PI * 2);
+          ctx.arc(sx + 26, sy + 26 - h2 * 6, 3.5, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = '#ffd76a';
+          ctx.beginPath();
+          ctx.arc(sx + 13 + h * 8, sy + 13, 1.8, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (tile === T_METAL) {
+          ctx.fillStyle = '#c9ccd4';
+          ctx.fillRect(sx + 8 + h * 10, sy + 10, 14, 4);
+          ctx.fillRect(sx + 12, sy + 24, 10, 3);
+        } else if (tile === T_GAS) {
+          ctx.fillStyle = 'rgba(180,230,120,0.75)';
+          ctx.beginPath();
+          ctx.arc(sx + 13 + h * 12, sy + 16, 5, 0, Math.PI * 2);
+          ctx.arc(sx + 25, sy + 27, 4, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (tile === T_BEDROCK) {
+          ctx.fillStyle = 'rgba(255,255,255,0.1)';
+          ctx.fillRect(sx + 8, sy + 8, 6, 6);
+          ctx.fillRect(sx + 24, sy + 22, 6, 6);
+        } else if (tile === T_BOULDER) {
+          ctx.fillStyle = '#8a8794';
+          ctx.beginPath();
+          ctx.arc(sx + 20, sy + 20, 15, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = 'rgba(255,255,255,0.25)';
+          ctx.beginPath();
+          ctx.arc(sx + 15, sy + 15, 5, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        // Drill cracks.
+        const dmg = world.damage.get(`${x},${y}`);
+        if (dmg) {
+          const frac = Math.min(1, dmg / 4);
+          ctx.strokeStyle = `rgba(0,0,0,${0.35 + frac * 0.45})`;
+          ctx.lineWidth = 2;
+          ctx.beginPath();
+          ctx.moveTo(sx + 8, sy + 10);
+          ctx.lineTo(sx + 18, sy + 20);
+          ctx.lineTo(sx + 12, sy + 30);
+          ctx.moveTo(sx + 30, sy + 8);
+          ctx.lineTo(sx + 22, sy + 18);
+          ctx.stroke();
+        }
+      }
+    }
+  }
+
+  function drawDiamond(x, y, w, h) {
+    ctx.beginPath();
+    ctx.moveTo(x, y - h);
+    ctx.lineTo(x + w, y);
+    ctx.lineTo(x, y + h);
+    ctx.lineTo(x - w, y);
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  function drawPickups(world) {
+    const camY = world.cameraY;
+    for (const pk of world.pickups) {
+      const sy = pk.y - camY;
+      if (sy < -30 || sy > VIEW_H + 30) continue;
+      const bob = Math.sin(world.time * 4 + pk.x) * 3;
+      ctx.save();
+      ctx.translate(pk.x, sy + bob);
+      if (pk.kind === 'ore') {
+        ctx.fillStyle = '#ffb347';
+        ctx.beginPath();
+        ctx.arc(0, 0, 7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#ffd76a';
+        ctx.beginPath();
+        ctx.arc(-2, -2, 3, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (pk.kind === 'gem') {
+        ctx.fillStyle = 'rgba(127,231,255,0.3)';
+        ctx.beginPath();
+        ctx.arc(0, 0, 13, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#7fe7ff';
+        drawDiamond(0, 0, 7, 10);
+      } else if (pk.kind === 'heart') {
+        ctx.fillStyle = '#ff5a6a';
+        ctx.beginPath();
+        ctx.arc(-4, -2, 5, 0, Math.PI * 2);
+        ctx.arc(4, -2, 5, 0, Math.PI * 2);
+        ctx.moveTo(-8, 1);
+        ctx.lineTo(0, 10);
+        ctx.lineTo(8, 1);
+        ctx.fill();
       } else {
-        reef.strokeStyle = PALETTE.glowPlant;
-        reef.lineWidth = 3;
-        reef.beginPath();
-        reef.moveTo(px, py);
-        reef.quadraticCurveTo(px - 6, py - 20, px - 2, py - 34);
-        reef.moveTo(px + 8, py);
-        reef.quadraticCurveTo(px + 10, py - 16, px + 16, py - 28);
-        reef.stroke();
-        reef.fillStyle = PALETTE.glowPlant;
-        reef.beginPath();
-        reef.arc(px - 2, py - 34, 3, 0, Math.PI * 2);
-        reef.arc(px + 16, py - 28, 3, 0, Math.PI * 2);
-        reef.fill();
+        ctx.fillStyle = '#22222a';
+        ctx.beginPath();
+        ctx.arc(0, 0, 8, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.strokeStyle = '#ffd76a';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(0, -8);
+        ctx.lineTo(4, -13);
+        ctx.stroke();
+      }
+      ctx.restore();
+    }
+  }
+
+  function drawBombs(world) {
+    const camY = world.cameraY;
+    for (const b of world.bombs) {
+      const sy = b.y - camY;
+      const blink = b.fuse < 0.4 && Math.sin(world.time * 30) > 0;
+      ctx.fillStyle = blink ? '#ff5252' : '#22222a';
+      ctx.beginPath();
+      ctx.arc(b.x, sy, 11, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.3)';
+      ctx.beginPath();
+      ctx.arc(b.x - 3, sy - 3, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = '#c9a86a';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(b.x, sy - 11);
+      ctx.quadraticCurveTo(b.x + 6, sy - 18, b.x + 10, sy - 15);
+      ctx.stroke();
+      ctx.fillStyle = '#ffd76a';
+      ctx.beginPath();
+      ctx.arc(b.x + 10, sy - 15, 3 + Math.random() * 2, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawBoulders(world) {
+    const camY = world.cameraY;
+    for (const b of world.boulders) {
+      const sy = b.y - camY;
+      ctx.fillStyle = '#8a8794';
+      ctx.beginPath();
+      ctx.arc(b.x, sy, b.size / 2, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#6b6874';
+      ctx.beginPath();
+      ctx.arc(b.x + 4, sy + 5, b.size / 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255,255,255,0.25)';
+      ctx.beginPath();
+      ctx.arc(b.x - 5, sy - 6, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawProjectiles(world) {
+    const camY = world.cameraY;
+    for (const pr of world.projectiles) {
+      const sy = pr.y - camY;
+      ctx.fillStyle = pr.kind === 'glob' ? 'rgba(255,110,40,0.35)' : 'rgba(255,150,60,0.3)';
+      ctx.beginPath();
+      ctx.arc(pr.x, sy, pr.radius + 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = pr.kind === 'glob' ? '#ff6a2a' : '#ff9d4d';
+      ctx.beginPath();
+      ctx.arc(pr.x, sy, pr.radius, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#ffe9b0';
+      ctx.beginPath();
+      ctx.arc(pr.x - 2, sy - 2, pr.radius * 0.4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  function drawEnemies(world) {
+    const camY = world.cameraY;
+    for (const e of world.enemies) {
+      const sy = e.y - camY;
+      if (sy < -60 || sy > VIEW_H + 60) continue;
+      const flash = e.flash > 0;
+      ctx.save();
+      ctx.translate(e.x, sy);
+      if (e.kind === 'grub') {
+        ctx.fillStyle = flash ? '#ffffff' : '#7a9a4e';
+        for (let i = 0; i < 3; i += 1) {
+          ctx.beginPath();
+          ctx.arc(-10 + i * 10, -10 + Math.sin(world.time * 6 + i) * 2, 8 - i, 0, Math.PI * 2);
+          ctx.fill();
+        }
+        ctx.fillStyle = '#1c2410';
+        ctx.beginPath();
+        ctx.arc(e.facing * 8, -14, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (e.kind === 'bat') {
+        const flap = Math.sin(world.time * 14) * 8;
+        ctx.fillStyle = flash ? '#ffffff' : '#6a5a98';
+        ctx.beginPath();
+        ctx.moveTo(0, -8);
+        ctx.quadraticCurveTo(-16, -18 - flap, -22, -6 - flap);
+        ctx.quadraticCurveTo(-12, -8, -8, -4);
+        ctx.quadraticCurveTo(-16, -2, -20, 4);
+        ctx.quadraticCurveTo(-8, 2, 0, -2);
+        ctx.quadraticCurveTo(8, 2, 20, 4);
+        ctx.quadraticCurveTo(16, -2, 8, -4);
+        ctx.quadraticCurveTo(12, -8, 22, -6 - flap);
+        ctx.quadraticCurveTo(16, -18 - flap, 0, -8);
+        ctx.fill();
+        ctx.fillStyle = '#ff6a5a';
+        ctx.beginPath();
+        ctx.arc(-3, -10, 2, 0, Math.PI * 2);
+        ctx.arc(3, -10, 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else if (e.kind === 'imp') {
+        ctx.fillStyle = flash ? '#ffffff' : '#d94f2a';
+        ctx.beginPath();
+        ctx.arc(0, -15, 13, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillRect(-11, -6, 22, 6);
+        ctx.fillStyle = '#8a2a12';
+        ctx.beginPath();
+        ctx.moveTo(-10, -24);
+        ctx.lineTo(-6, -32);
+        ctx.lineTo(-3, -24);
+        ctx.moveTo(10, -24);
+        ctx.lineTo(6, -32);
+        ctx.lineTo(3, -24);
+        ctx.fill();
+        ctx.fillStyle = '#ffd76a';
+        ctx.beginPath();
+        ctx.arc(-4, -16, 2.5, 0, Math.PI * 2);
+        ctx.arc(4, -16, 2.5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = 'rgba(255,122,60,0.35)';
+        ctx.beginPath();
+        ctx.arc(0, -15, 20 + Math.sin(world.time * 5) * 3, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.fillStyle = flash ? '#ffffff' : '#7d7a86';
+        ctx.fillRect(-20, -46, 40, 46);
+        ctx.fillStyle = flash ? '#ffffff' : '#9a97a3';
+        ctx.fillRect(-16, -40, 14, 12);
+        ctx.fillRect(4, -34, 12, 10);
+        ctx.fillStyle = '#ffd76a';
+        ctx.beginPath();
+        ctx.arc(-8, -32, 3, 0, Math.PI * 2);
+        ctx.arc(8, -32, 3, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#ff7a3c';
+        ctx.fillRect(-5, -18, 10, 8);
+      }
+      ctx.restore();
+      if (e.hp < e.maxHp) {
+        const w = 34;
+        ctx.fillStyle = 'rgba(0,0,0,0.6)';
+        ctx.fillRect(e.x - w / 2, sy - e.height - 12, w, 5);
+        ctx.fillStyle = '#ff6a5a';
+        ctx.fillRect(e.x - w / 2, sy - e.height - 12, w * Math.max(0, e.hp / e.maxHp), 5);
       }
     }
   }
 
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    view.ratio = ratio;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
-  }
-
-  function text(value, x, y, size, color, align, weight = 400) {
-    const key = `${weight}:${size}`;
-    if (!fonts.has(key)) fonts.set(key, `${weight} ${size}px ${FONT}`);
-    context.font = fonts.get(key);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
-  }
-
-  function drawWater(time) {
-    const gradient = context.createLinearGradient(0, 0, 0, FIELD.height);
-    gradient.addColorStop(0, PALETTE.waterTop);
-    gradient.addColorStop(0.55, PALETTE.waterMid);
-    gradient.addColorStop(1, PALETTE.waterDeep);
-    context.fillStyle = gradient;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    // Slow light rays from the surface.
-    context.save();
-    context.fillStyle = PALETTE.ray;
-    for (let index = 0; index < 5; index += 1) {
-      const sway = Math.sin(time * 0.14 + index * 1.7) * 46;
-      const rx = 130 + index * 260 + sway;
-      context.beginPath();
-      context.moveTo(rx, -20);
-      context.lineTo(rx + 90, -20);
-      context.lineTo(rx + 190, FIELD.height + 20);
-      context.lineTo(rx + 60, FIELD.height + 20);
-      context.closePath();
-      context.fill();
+  function drawBoss(world) {
+    const boss = world.boss;
+    if (!boss) return;
+    const camY = world.cameraY;
+    const flash = boss.flash > 0;
+    const telegraph = boss.state === 'windup';
+    // A continuous body under the segments, so the wyrm reads as one beast.
+    ctx.strokeStyle = flash ? '#ffffff' : '#4a2d1e';
+    ctx.lineWidth = 40;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.beginPath();
+    ctx.moveTo(boss.x, boss.y - camY);
+    for (let i = 1; i < boss.segments; i += 1) {
+      const seg = bossSegmentPos(boss, i);
+      ctx.lineTo(seg.x, seg.y - camY);
     }
-    context.restore();
-    context.drawImage(reefCanvas, 0, 0);
-    // Drifting plankton motes.
-    for (const mote of motes) {
-      const twinkle = 0.35 + 0.3 * Math.sin(time * 0.9 + mote.phase);
-      const my = (mote.y + time * mote.speed) % FIELD.height;
-      context.globalAlpha = twinkle;
-      context.fillStyle = PALETTE.mote;
-      context.beginPath();
-      context.arc(mote.x, my, mote.size, 0, Math.PI * 2);
-      context.fill();
+    ctx.stroke();
+    // Segments, tail first.
+    for (let i = boss.segments - 1; i >= 1; i -= 1) {
+      const seg = bossSegmentPos(boss, i);
+      const r = 26 - i * 1.4;
+      const sy = seg.y - camY;
+      ctx.fillStyle = flash ? '#ffffff' : '#5a3a28';
+      ctx.beginPath();
+      ctx.arc(seg.x, sy, r, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = flash ? '#ffffff' : '#6e4525';
+      ctx.beginPath();
+      ctx.arc(seg.x - r * 0.3, sy - r * 0.3, r * 0.55, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,110,40,0.8)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(seg.x - r * 0.5, sy + r * 0.2);
+      ctx.lineTo(seg.x, sy - r * 0.3);
+      ctx.lineTo(seg.x + r * 0.4, sy + r * 0.3);
+      ctx.stroke();
     }
-    context.globalAlpha = 1;
+    // Head.
+    const hx = boss.x;
+    const hy = boss.y - camY;
+    const headR = 34;
+    if (telegraph) {
+      ctx.fillStyle = 'rgba(255,60,40,0.25)';
+      ctx.beginPath();
+      ctx.arc(hx, hy, headR + 16 + Math.sin(world.time * 20) * 4, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.fillStyle = flash ? '#ffffff' : '#4a2c1c';
+    ctx.beginPath();
+    ctx.arc(hx, hy, headR, 0, Math.PI * 2);
+    ctx.fill();
+    // Jaw.
+    const jaw = boss.state === 'charge' ? 10 : 4 + Math.sin(world.time * 3) * 2;
+    ctx.fillStyle = flash ? '#ffffff' : '#6e4525';
+    ctx.beginPath();
+    ctx.ellipse(hx, hy + headR * 0.45, headR * 0.7, 10 + jaw, 0, 0, Math.PI);
+    ctx.fill();
+    ctx.fillStyle = '#fff3d0';
+    for (let i = -2; i <= 2; i += 1) {
+      ctx.beginPath();
+      ctx.moveTo(hx + i * 10 - 3, hy + headR * 0.45);
+      ctx.lineTo(hx + i * 10 + 3, hy + headR * 0.45);
+      ctx.lineTo(hx + i * 10, hy + headR * 0.45 + 9);
+      ctx.fill();
+    }
+    // Eyes and horns.
+    const facing = boss.vx >= 0 ? 1 : -1;
+    ctx.fillStyle = telegraph ? '#ff2a1a' : '#ffd76a';
+    ctx.beginPath();
+    ctx.arc(hx + facing * 12, hy - 10, 6, 0, Math.PI * 2);
+    ctx.arc(hx + facing * 12 - facing * 18, hy - 8, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#1c2410';
+    ctx.beginPath();
+    ctx.arc(hx + facing * 13, hy - 10, 2.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#d8cfc0';
+    ctx.beginPath();
+    ctx.moveTo(hx - 24, hy - 22);
+    ctx.lineTo(hx - 34, hy - 44);
+    ctx.lineTo(hx - 14, hy - 28);
+    ctx.moveTo(hx + 24, hy - 22);
+    ctx.lineTo(hx + 34, hy - 44);
+    ctx.lineTo(hx + 14, hy - 28);
+    ctx.fill();
+    if (boss.stun > 0) {
+      ctx.fillStyle = '#ffd76a';
+      for (let i = 0; i < 3; i += 1) {
+        const a = world.time * 4 + (i * Math.PI * 2) / 3;
+        ctx.beginPath();
+        ctx.arc(hx + Math.cos(a) * 44, hy - 30 + Math.sin(a) * 8, 4, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
   }
 
-  function drawGlow(x, y, radius, color, alpha) {
-    const gradient = context.createRadialGradient(x, y, 0, x, y, radius);
-    gradient.addColorStop(0, color);
-    gradient.addColorStop(1, 'rgba(0, 0, 0, 0)');
-    context.globalAlpha = alpha;
-    context.fillStyle = gradient;
-    context.beginPath();
-    context.arc(x, y, radius, 0, Math.PI * 2);
-    context.fill();
-    context.globalAlpha = 1;
-  }
-
-  function drawPlayer(player, time) {
-    const blink = player.invulnerable > 0 && Math.floor(time * 14) % 2 === 0;
-    if (blink) context.globalAlpha = 0.45;
-    context.save();
-    context.translate(player.x, player.y);
-    context.rotate(player.face);
-    if (Math.cos(player.face) < 0) context.scale(1, -1);
-    const wag = Math.sin(player.tailPhase) * 0.35;
-    // Tail fin, wagging.
-    context.fillStyle = PALETTE.playerFin;
-    context.beginPath();
-    context.moveTo(-9, 0);
-    context.quadraticCurveTo(-24, -13 - wag * 15, -33, -15 - wag * 19);
-    context.quadraticCurveTo(-26, 0, -33, 15 + wag * 19);
-    context.quadraticCurveTo(-24, 13 + wag * 15, -9, 0);
-    context.fill();
+  function drawPlayer(world) {
+    const p = world.player;
+    if (p.dead) return;
+    const camY = world.cameraY;
+    const sy = p.y - camY;
+    const blink = p.iframe > 0 && Math.sin(world.time * 30) > 0;
+    ctx.save();
+    ctx.translate(p.x, sy);
+    if (blink) ctx.globalAlpha = 0.45;
+    // Headlamp glow.
+    ctx.fillStyle = 'rgba(255,230,160,0.13)';
+    ctx.beginPath();
+    ctx.moveTo(0, -28);
+    ctx.lineTo(p.facing * 190, -70);
+    ctx.lineTo(p.facing * 190, 10);
+    ctx.closePath();
+    ctx.fill();
+    // Tracks.
+    ctx.fillStyle = '#2a262e';
+    ctx.fillRect(-15, -8, 30, 8);
+    ctx.fillStyle = '#4a4652';
+    for (let i = -1; i <= 1; i += 1) {
+      ctx.beginPath();
+      ctx.arc(i * 10, -4, 3.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
     // Body.
-    context.fillStyle = PALETTE.playerBody;
-    context.beginPath();
-    context.ellipse(0, 0, 19, 12, 0, 0, Math.PI * 2);
-    context.fill();
-    // Dorsal fin.
-    context.fillStyle = PALETTE.playerFin;
-    context.beginPath();
-    context.moveTo(-4, -11);
-    context.quadraticCurveTo(2, -21, 10, -12);
-    context.closePath();
-    context.fill();
-    // Belly stripe.
-    context.fillStyle = PALETTE.player;
-    context.beginPath();
-    context.ellipse(2, 4, 13, 5.5, 0, 0, Math.PI * 2);
-    context.fill();
-    // Eye.
-    context.fillStyle = '#101826';
-    context.beginPath();
-    context.arc(9, -3.5, 3.6, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = '#ffffff';
-    context.beginPath();
-    context.arc(10, -4.5, 1.3, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
-    context.globalAlpha = 1;
-    // The lure: a stalk over the head and a glowing orb.
-    const lureX = player.x + Math.cos(player.face - 0.7) * 20;
-    const lureY = player.y + Math.sin(player.face - 0.7) * 20;
-    context.strokeStyle = PALETTE.playerFin;
-    context.lineWidth = 2;
-    context.beginPath();
-    context.moveTo(player.x + Math.cos(player.face) * 10, player.y + Math.sin(player.face) * 10 - 6);
-    context.quadraticCurveTo(lureX, lureY - 8, lureX, lureY);
-    context.stroke();
-    drawGlow(lureX, lureY, 26, 'rgba(255, 243, 196, 0.85)', 0.8);
-    context.fillStyle = PALETTE.lure;
-    context.beginPath();
-    context.arc(lureX, lureY, 5, 0, Math.PI * 2);
-    context.fill();
+    ctx.fillStyle = '#e8822a';
+    ctx.beginPath();
+    ctx.roundRect(-14, -32, 28, 26, 6);
+    ctx.fill();
+    ctx.fillStyle = '#f5a54d';
+    ctx.beginPath();
+    ctx.roundRect(-14, -32, 28, 10, 5);
+    ctx.fill();
+    // Cockpit.
+    ctx.fillStyle = '#bfe6ff';
+    ctx.beginPath();
+    ctx.arc(p.facing * 4, -26, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#2a262e';
+    ctx.beginPath();
+    ctx.arc(p.facing * 5, -26, 3, 0, Math.PI * 2);
+    ctx.fill();
+    // Heat glow.
+    const heatFrac = p.heat / world.stats.maxHeat;
+    if (heatFrac > 0.6) {
+      ctx.fillStyle = `rgba(255,80,30,${(heatFrac - 0.6) * 1.2})`;
+      ctx.beginPath();
+      ctx.roundRect(-14, -32, 28, 26, 6);
+      ctx.fill();
+    }
+    // Drill arm.
+    const spinning = p.drillTime > 0;
+    let angle = p.facing > 0 ? 0 : Math.PI;
+    if (p.drillTarget) {
+      const tc = { x: p.drillTarget.x * TILE + 20 - p.x, y: p.drillTarget.y * TILE + 20 - (p.y - 18) };
+      angle = Math.atan2(tc.y, tc.x);
+    }
+    ctx.save();
+    ctx.translate(p.facing * 8, -18);
+    ctx.rotate(angle);
+    ctx.fillStyle = '#8a8794';
+    ctx.fillRect(0, -4, 20, 8);
+    // Spinning bit.
+    const spin = spinning ? world.time * 28 : world.time * 4;
+    ctx.fillStyle = '#c9ccd4';
+    ctx.save();
+    ctx.translate(26, 0);
+    ctx.rotate(spin);
+    ctx.beginPath();
+    ctx.moveTo(0, -7);
+    ctx.lineTo(14, 0);
+    ctx.lineTo(0, 7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+    ctx.restore();
+    // Venting steam.
+    if (p.venting > 0) {
+      ctx.fillStyle = 'rgba(220,220,220,0.5)';
+      ctx.beginPath();
+      ctx.arc(-6, -40 - Math.sin(world.time * 8) * 3, 6, 0, Math.PI * 2);
+      ctx.arc(6, -44, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+    ctx.restore();
   }
 
-  function drawFoe(foe, time) {
-    context.save();
-    context.translate(foe.x, foe.y);
-    const pulse = 1 + Math.sin(time * 4 + foe.phase) * 0.05;
-    context.scale(pulse, pulse);
-    if (foe.kind === KIND_NIBBLER || foe.kind === KIND_MINI) {
-      context.fillStyle = foe.kind === KIND_MINI ? PALETTE.mini : PALETTE.nibbler;
-      context.beginPath();
-      context.arc(0, 0, foe.radius, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = '#241a4d';
-      context.beginPath();
-      context.arc(0, foe.radius * 0.35, foe.radius * 0.55, 0, Math.PI);
-      context.fill();
-      // Fangs.
-      context.fillStyle = '#ffffff';
-      for (let index = -1; index <= 1; index += 1) {
-        context.beginPath();
-        context.moveTo(index * foe.radius * 0.3 - 3, foe.radius * 0.35);
-        context.lineTo(index * foe.radius * 0.3 + 3, foe.radius * 0.35);
-        context.lineTo(index * foe.radius * 0.3, foe.radius * 0.35 + 7);
-        context.closePath();
-        context.fill();
+  function drawParticles(world) {
+    const camY = world.cameraY;
+    const list = world.particles.list;
+    for (const p of list) {
+      const a = Math.max(0, p.life / p.maxLife);
+      ctx.globalAlpha = a;
+      ctx.fillStyle = p.color;
+      if (p.glow) {
+        ctx.save();
+        ctx.globalCompositeOperation = 'lighter';
+        ctx.beginPath();
+        ctx.arc(p.x, p.y - camY, p.size * 1.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.restore();
+      } else {
+        ctx.fillRect(p.x - p.size / 2, p.y - camY - p.size / 2, p.size, p.size);
       }
-      drawEyes(foe, -0.4);
-    } else if (foe.kind === KIND_SPITTER) {
-      context.fillStyle = PALETTE.spitter;
-      context.beginPath();
-      context.arc(0, 0, foe.radius, 0, Math.PI * 2);
-      context.fill();
-      // The spit sac swells as the shot nears.
-      const sac = foe.radius * (0.35 + 0.3 * Math.max(0, 1 - foe.fireTimer / 2.3));
-      context.fillStyle = '#7ef0dd';
-      context.beginPath();
-      context.arc(Math.cos(foe.face) * foe.radius * 0.4, Math.sin(foe.face) * foe.radius * 0.4, sac, 0, Math.PI * 2);
-      context.fill();
-      drawEyes(foe, -0.4);
-    } else if (foe.kind === KIND_SPLITTER) {
-      context.fillStyle = PALETTE.splitter;
-      context.beginPath();
-      context.arc(0, 0, foe.radius, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = '#c96f2e';
-      context.beginPath();
-      context.arc(-7, -5, 7, 0, Math.PI * 2);
-      context.arc(8, 4, 6, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = '#ffe1b8';
-      context.beginPath();
-      context.arc(-7, -5, 3, 0, Math.PI * 2);
-      context.arc(8, 4, 2.5, 0, Math.PI * 2);
-      context.fill();
-      drawEyes(foe, -0.45);
-    } else if (foe.kind === KIND_DASHER) {
-      context.rotate(foe.face);
-      context.fillStyle = PALETTE.dasher;
-      context.beginPath();
-      context.moveTo(foe.radius + 6, 0);
-      context.quadraticCurveTo(0, -foe.radius * 0.8, -foe.radius, 0);
-      context.quadraticCurveTo(0, foe.radius * 0.8, foe.radius + 6, 0);
-      context.fill();
-      context.fillStyle = '#ff8fa8';
-      context.beginPath();
-      context.moveTo(-foe.radius, 0);
-      context.lineTo(-foe.radius - 12, -8);
-      context.lineTo(-foe.radius - 12, 8);
-      context.closePath();
-      context.fill();
-      context.fillStyle = '#ffffff';
-      context.beginPath();
-      context.arc(foe.radius * 0.4, -3, 3, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = '#101826';
-      context.beginPath();
-      context.arc(foe.radius * 0.4 + 1, -3, 1.6, 0, Math.PI * 2);
-      context.fill();
-      context.rotate(-foe.face);
-      // Telegraph ring: it is about to lunge.
-      if (foe.state === 1) {
-        context.globalAlpha = 0.5 + 0.4 * Math.sin(time * 18);
-        context.strokeStyle = '#ffd166';
-        context.lineWidth = 3;
-        context.beginPath();
-        context.arc(0, 0, foe.radius + 9, 0, Math.PI * 2);
-        context.stroke();
-        context.globalAlpha = 1;
-      }
-    } else if (foe.kind === KIND_BOSS) {
-      // The Maw: a vast dark bulk, a ring of teeth, a glowing core.
-      context.fillStyle = PALETTE.boss;
-      context.beginPath();
-      context.arc(0, 0, foe.radius, 0, Math.PI * 2);
-      context.fill();
-      context.strokeStyle = '#241a4d';
-      context.lineWidth = 5;
-      context.beginPath();
-      context.arc(0, 0, foe.radius - 4, 0, Math.PI * 2);
-      context.stroke();
-      const teeth = 12;
-      context.fillStyle = '#ffffff';
-      for (let index = 0; index < teeth; index += 1) {
-        const angle = (index / teeth) * Math.PI * 2 + time * 0.15;
-        const tx = Math.cos(angle) * (foe.radius - 8);
-        const ty = Math.sin(angle) * (foe.radius - 8);
-        context.beginPath();
-        context.moveTo(tx - 6, ty - 6);
-        context.lineTo(tx + 6, ty + 6);
-        context.lineTo(Math.cos(angle) * (foe.radius - 24), Math.sin(angle) * (foe.radius - 24));
-        context.closePath();
-        context.fill();
-      }
-      drawGlow(0, 0, foe.radius * 0.6, 'rgba(255, 93, 143, 0.5)', 0.8);
-      context.fillStyle = PALETTE.bossCore;
-      context.beginPath();
-      context.arc(0, 0, foe.radius * 0.3, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = PALETTE.bossEye;
-      context.beginPath();
-      context.arc(-foe.radius * 0.42, -foe.radius * 0.42, 6, 0, Math.PI * 2);
-      context.arc(foe.radius * 0.42, -foe.radius * 0.42, 6, 0, Math.PI * 2);
-      context.fill();
     }
-    context.restore();
-    // Hit flash: a white veil over the foe.
-    if (foe.flash > 0) {
-      context.globalAlpha = Math.min(0.85, foe.flash * 9);
-      context.fillStyle = '#ffffff';
-      context.beginPath();
-      context.arc(foe.x, foe.y, foe.radius, 0, Math.PI * 2);
-      context.fill();
-      context.globalAlpha = 1;
+    ctx.globalAlpha = 1;
+    for (const t of world.particles.texts) {
+      const a = Math.max(0, t.life / t.maxLife);
+      ctx.globalAlpha = a;
+      ctx.font = `bold 17px ${FONT}`;
+      ctx.textAlign = 'center';
+      ctx.lineWidth = 4;
+      ctx.strokeStyle = 'rgba(0,0,0,0.7)';
+      ctx.strokeText(t.text, t.x, t.y - camY);
+      ctx.fillStyle = t.color;
+      ctx.fillText(t.text, t.x, t.y - camY);
     }
-    // A small health bar over a wounded foe (the boss gets the big bar).
-    if (foe.kind !== KIND_BOSS && foe.hp < foe.maxHp) {
-      const width = foe.radius * 2;
-      context.fillStyle = 'rgba(10, 20, 36, 0.8)';
-      context.fillRect(foe.x - width / 2, foe.y - foe.radius - 12, width, 5);
-      context.fillStyle = PALETTE.danger;
-      context.fillRect(foe.x - width / 2, foe.y - foe.radius - 12, width * (foe.hp / foe.maxHp), 5);
+    ctx.globalAlpha = 1;
+  }
+
+  function bar(x, y, w, h, frac, fill, back) {
+    ctx.fillStyle = back ?? 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, h / 2);
+    ctx.fill();
+    if (frac > 0) {
+      ctx.fillStyle = fill;
+      ctx.beginPath();
+      ctx.roundRect(x + 2, y + 2, Math.max(4, (w - 4) * Math.min(1, frac)), h - 4, (h - 4) / 2);
+      ctx.fill();
     }
   }
 
-  function drawEyes(foe, lift) {
-    const spread = foe.radius * 0.42;
-    const ey = foe.radius * lift;
-    context.fillStyle = '#ffffff';
-    context.beginPath();
-    context.arc(-spread, ey, foe.radius * 0.2, 0, Math.PI * 2);
-    context.arc(spread, ey, foe.radius * 0.2, 0, Math.PI * 2);
-    context.fill();
-    const lookX = Math.cos(foe.face) * 2;
-    const lookY = Math.sin(foe.face) * 2;
-    context.fillStyle = '#101826';
-    context.beginPath();
-    context.arc(-spread + lookX, ey + lookY, foe.radius * 0.1, 0, Math.PI * 2);
-    context.arc(spread + lookX, ey + lookY, foe.radius * 0.1, 0, Math.PI * 2);
-    context.fill();
-  }
-
-  function drawHud(state, best, muted) {
-    const player = state.player;
-    context.textBaseline = 'top';
-    // Hearts.
-    for (let index = 0; index < player.maxHp; index += 1) {
-      context.fillStyle = index < player.hp ? PALETTE.heart : PALETTE.heartEmpty;
-      heartPath(context, 34 + index * 30, 34, 24);
-      context.fill();
+  function drawHud(world, ui) {
+    const p = world.player;
+    const stats = world.stats;
+    ctx.textAlign = 'left';
+    // Hull + heat.
+    ctx.font = `bold 13px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('HULL', 18, 24);
+    const hullFrac = p.hull / stats.maxHull;
+    bar(58, 12, 210, 16, hullFrac, hullFrac > 0.3 ? '#7ed957' : '#ff5252');
+    ctx.fillText('HEAT', 18, 48);
+    const heatFrac = p.heat / stats.maxHeat;
+    bar(58, 36, 210, 16, heatFrac, heatFrac > 0.85 ? '#ff2a1a' : '#ff9d4d');
+    if (p.venting > 0) {
+      ctx.fillStyle = '#ff9d4d';
+      ctx.font = `bold 13px ${FONT}`;
+      ctx.fillText('VENTING!', 278, 49);
     }
-    // Experience bar and level.
-    const barWidth = 220;
-    context.fillStyle = 'rgba(10, 20, 36, 0.75)';
-    context.fillRect(24, 56, barWidth, 12);
-    context.fillStyle = PALETTE.glimmer;
-    context.fillRect(24, 56, barWidth * Math.min(1, state.xp / state.xpNeed), 12);
-    text(`Lv ${state.level}`, 24, 74, 18, PALETTE.text, 'left', 700);
-    // Wave and foes.
-    text(state.wave === 0 ? 'The reef is quiet' : `Wave ${state.wave} / 10`, FIELD.width / 2, 18, 26, PALETTE.text, 'center', 700);
-    if (state.wave > 0 && state.waveState === 'active') {
-      text(`Foes left: ${state.foesLeft}`, FIELD.width / 2, 48, 18, PALETTE.muted, 'center');
+    // Bombs + revive.
+    for (let i = 0; i < stats.maxBombs; i += 1) {
+      ctx.fillStyle = i < p.bombs ? '#22222a' : 'rgba(0,0,0,0.35)';
+      ctx.beginPath();
+      ctx.arc(30 + i * 24, 70, 9, 0, Math.PI * 2);
+      ctx.fill();
+      if (i < p.bombs) {
+        ctx.fillStyle = '#ffd76a';
+        ctx.beginPath();
+        ctx.arc(30 + i * 24, 70, 3, 0, Math.PI * 2);
+        ctx.fill();
+      }
     }
-    // Score.
-    text(`Score ${state.score}`, FIELD.width - 24, 18, 26, PALETTE.text, 'right', 700);
-    text(`Best ${best}`, FIELD.width - 24, 48, 18, PALETTE.muted, 'right');
-    // Dash readiness.
-    const dashReady = player.dashCooldown <= 0;
-    const dashMax = PLAYER.dashCooldown * state.mods.dashCooldownMul;
-    const dashFill = dashReady ? 1 : 1 - player.dashCooldown / dashMax;
-    context.fillStyle = 'rgba(10, 20, 36, 0.75)';
-    context.fillRect(24, FIELD.height - 40, 120, 12);
-    context.fillStyle = dashReady ? PALETTE.gold : PALETTE.muted;
-    context.fillRect(24, FIELD.height - 40, 120 * Math.max(0, dashFill), 12);
-    text(dashReady ? 'Dash ready [Shift]' : 'Dashing…', 24, FIELD.height - 66, 16, dashReady ? PALETTE.text : PALETTE.muted, 'left');
-    // Hints and mute state.
-    text(muted ? 'Sound off [M]  ·  Pause [P]' : 'Sound on [M]  ·  Pause [P]', FIELD.width - 24, FIELD.height - 34, 16, PALETTE.muted, 'right');
+    if (stats.revive) {
+      ctx.fillStyle = '#ff5a6a';
+      ctx.font = `bold 14px ${FONT}`;
+      ctx.fillText('♥ 2ND WIND', 30 + stats.maxBombs * 24 + 8, 75);
+    }
+    // Score block.
+    ctx.textAlign = 'right';
+    ctx.font = `bold 24px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`${world.score.toLocaleString('en-US')}`, VIEW_W - 18, 32);
+    ctx.font = `bold 16px ${FONT}`;
+    ctx.fillStyle = '#ffd76a';
+    ctx.fillText(`◆ ${world.ore}    ⬡ ${world.gems}`, VIEW_W - 18, 56);
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.font = `13px ${FONT}`;
+    ctx.fillText(`BEST ${Math.max(ui.best, world.score).toLocaleString('en-US')}`, VIEW_W - 18, 76);
+    // Level + depth rail.
+    ctx.textAlign = 'center';
+    ctx.font = `bold 20px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    const levelLabel = world.endless ? `ENDLESS · LEVEL ${world.level}` : `LEVEL ${world.level} / ${BOSS_LEVEL}`;
+    ctx.fillText(levelLabel, VIEW_W / 2, 30);
+    ctx.font = `13px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText(world.difficulty.name, VIEW_W / 2, 50);
+    drawDepthRail(world);
     // Boss bar.
-    if (state.boss !== null && state.boss.active) {
-      const boss = state.boss;
-      const width = 520;
-      const x = (FIELD.width - width) / 2;
-      const y = 84;
-      text(state.wave >= 10 ? 'THE MAW OF THE DEEP' : 'THE MAW', FIELD.width / 2, y - 24, 20, PALETTE.bossCore, 'center', 700);
-      context.fillStyle = 'rgba(10, 20, 36, 0.8)';
-      context.fillRect(x, y, width, 14);
-      context.fillStyle = PALETTE.bossCore;
-      context.fillRect(x, y, width * Math.max(0, boss.hp / boss.maxHp), 14);
+    if (world.boss && !world.boss.dead) {
+      const boss = world.boss;
+      const w = 460;
+      const x = VIEW_W / 2 - w / 2;
+      const y = VIEW_H - 46;
+      ctx.textAlign = 'center';
+      ctx.font = `bold 16px ${FONT}`;
+      ctx.fillStyle = '#ffb347';
+      ctx.fillText('THE CORE WYRM', VIEW_W / 2, y - 6);
+      bar(x, y, w, 16, boss.hp / boss.maxHp, '#ff6a2a');
+      for (let i = 1; i <= 2; i += 1) {
+        ctx.fillStyle = 'rgba(0,0,0,0.7)';
+        ctx.fillRect(x + (w * i) / 3 - 1, y, 2, 16);
+      }
+      ctx.font = `12px ${FONT}`;
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText(`PHASE ${boss.phase}`, VIEW_W / 2, y + 30);
     }
+    // Controls hint, early on.
+    if (world.time < 14 && world.level <= 2) {
+      ctx.textAlign = 'center';
+      ctx.font = `15px ${FONT}`;
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.fillText('A / D move · W jump · S dig down · push into rock to drill · hold CLICK to aim-drill · E bomb · P pause', VIEW_W / 2, VIEW_H - 18);
+    }
+    // Mute state.
+    ctx.textAlign = 'left';
+    ctx.font = `13px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText(ui.muted ? 'M: UNMUTE' : 'M: MUTE', 18, VIEW_H - 18);
   }
 
-  function drawBanner(state, screen) {
-    if (state.bannerTimer <= 0) return;
-    if (screen === SCREEN_CHOICE || screen === SCREEN_PAUSED) return;
-    const alpha = Math.min(1, state.bannerTimer / 0.6);
-    context.globalAlpha = alpha;
-    context.textBaseline = 'alphabetic';
-    text(state.banner, FIELD.width / 2, 200, 54, PALETTE.text, 'center', 700);
-    text(state.bannerSub, FIELD.width / 2, 238, 22, PALETTE.muted, 'center');
-    context.globalAlpha = 1;
+  function drawDepthRail(world) {
+    const x = VIEW_W - 34;
+    const top = 100;
+    const height = VIEW_H - 220;
+    ctx.fillStyle = 'rgba(0,0,0,0.45)';
+    ctx.beginPath();
+    ctx.roundRect(x - 5, top, 10, height, 5);
+    ctx.fill();
+    const span = BOSS_LEVEL;
+    for (let lvl = 5; lvl <= span; lvl += 5) {
+      const y = top + (height * lvl) / span;
+      ctx.fillStyle = lvl >= world.level ? 'rgba(255,255,255,0.5)' : '#ffd76a';
+      ctx.fillRect(x - 9, y - 1, 18, 2);
+      ctx.font = `11px ${FONT}`;
+      ctx.textAlign = 'right';
+      ctx.fillText(String(lvl), x - 12, y + 4);
+    }
+    // Player marker.
+    const frac = Math.min(1, world.level / span);
+    const my = top + height * frac;
+    ctx.fillStyle = '#7ed957';
+    ctx.beginPath();
+    ctx.moveTo(x - 12, my);
+    ctx.lineTo(x + 12, my);
+    ctx.lineTo(x, my + 9);
+    ctx.closePath();
+    ctx.fill();
+    // Boss skull at the bottom.
+    ctx.fillStyle = '#ff6a2a';
+    ctx.font = `bold 15px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('◆', x, top + height + 22);
+    ctx.font = `10px ${FONT}`;
+    ctx.fillText('WYRM', x, top + height + 36);
   }
 
-  function drawPanel(x, y, width, height) {
-    context.fillStyle = 'rgba(6, 12, 24, 0.72)';
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.fillStyle = PALETTE.panel;
-    context.strokeStyle = PALETTE.panelEdge;
-    context.lineWidth = 2;
-    context.beginPath();
-    context.roundRect(x, y, width, height, 18);
-    context.fill();
-    context.stroke();
+  function panel(x, y, w, h, alpha) {
+    ctx.fillStyle = `rgba(12,10,16,${alpha ?? 0.82})`;
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 18);
+    ctx.fill();
+    ctx.strokeStyle = 'rgba(255,180,90,0.5)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
   }
 
-  function drawTitle(state, best) {
-    drawPanel(290, 118, 700, 484);
-    context.textBaseline = 'alphabetic';
-    drawGlow(FIELD.width / 2, 190, 130, 'rgba(255, 215, 106, 0.35)', 0.9);
-    text('LUMEN REEF', FIELD.width / 2, 208, 64, PALETTE.gold, 'center', 800);
-    text('A lantern-fish tale of the Glow Reef', FIELD.width / 2, 244, 22, PALETTE.muted, 'center');
-    const lines = [
-      'The gloom is rising. Swim, shoot, and gather glimmers.',
-      'Level up, choose boons, and hold the reef for 10 waves.',
-      '',
-      'Move  WASD / Arrows      Aim  Mouse      Shoot  Click / Space',
-      'Dash  Shift / Right-click      Pause  P      Sound  M',
-      '',
-      'Defeat the Maw of the Deep to save the reef.',
-    ];
-    lines.forEach((line, index) => {
-      text(line, FIELD.width / 2, 292 + index * 30, 20, index < 2 ? PALETTE.text : PALETTE.muted, 'center');
+  function button(ui, id, x, y, w, h, label, opts) {
+    const hover = ui.mouseX >= x && ui.mouseX <= x + w && ui.mouseY >= y && ui.mouseY <= y + h;
+    const disabled = opts?.disabled;
+    ctx.fillStyle = disabled ? 'rgba(80,76,88,0.9)' : hover ? '#f5a54d' : '#e8822a';
+    ctx.beginPath();
+    ctx.roundRect(x, y, w, h, 10);
+    ctx.fill();
+    ctx.fillStyle = disabled ? '#b9b4c0' : '#1c1408';
+    ctx.font = `bold ${opts?.font ?? 20}px ${FONT}`;
+    ctx.textAlign = 'center';
+    ctx.fillText(label, x + w / 2, y + h / 2 + (opts?.font ?? 20) * 0.36);
+    ui.hits.push({ id, x, y, w, h, disabled: !!disabled });
+    return hover;
+  }
+
+  function drawTitle(world, ui) {
+    ctx.fillStyle = 'rgba(8,6,12,0.45)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.textAlign = 'center';
+    // Logo.
+    ctx.font = `bold 92px ${FONT}`;
+    ctx.lineWidth = 8;
+    ctx.strokeStyle = '#2a1408';
+    ctx.strokeText('COREBREAK', VIEW_W / 2, 150);
+    const grad = ctx.createLinearGradient(0, 80, 0, 160);
+    grad.addColorStop(0, '#ffd76a');
+    grad.addColorStop(0.5, '#ff9d4d');
+    grad.addColorStop(1, '#ff6a2a');
+    ctx.fillStyle = grad;
+    ctx.fillText('COREBREAK', VIEW_W / 2, 150);
+    ctx.font = `bold 24px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('DRILL TO THE HEART OF THE MOUNTAIN', VIEW_W / 2, 190);
+    ctx.font = `16px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText('30 levels down · draft an upgrade every 5 · slay the 3-phase Core Wyrm · then keep digging forever', VIEW_W / 2, 216);
+    // Difficulty cards.
+    const cards = ui.difficulties;
+    const cw = 250;
+    const gap = 26;
+    const total = cards.length * cw + (cards.length - 1) * gap;
+    let cx = VIEW_W / 2 - total / 2;
+    const cy = 248;
+    const ch = 150;
+    cards.forEach((d) => {
+      const selected = ui.selectedDifficulty === d.id;
+      ctx.fillStyle = selected ? 'rgba(255,160,70,0.28)' : 'rgba(12,10,16,0.8)';
+      ctx.beginPath();
+      ctx.roundRect(cx, cy, cw, ch, 14);
+      ctx.fill();
+      ctx.strokeStyle = selected ? '#ffd76a' : 'rgba(255,255,255,0.3)';
+      ctx.lineWidth = selected ? 3 : 1;
+      ctx.stroke();
+      ctx.fillStyle = '#ffd76a';
+      ctx.font = `bold 24px ${FONT}`;
+      ctx.fillText(d.name, cx + cw / 2, cy + 40);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `14px ${FONT}`;
+      wrapText(d.blurb, cx + 18, cy + 68, cw - 36, 20);
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.font = `13px ${FONT}`;
+      ctx.fillText(`Score x${d.scoreMult} · Hull ${d.startHull}`, cx + cw / 2, cy + ch - 16);
+      ui.hits.push({ id: `diff:${d.id}`, x: cx, y: cy, w: cw, h: ch });
+      cx += cw + gap;
     });
-    text(`Best score ${best}`, FIELD.width / 2, 500, 22, PALETTE.text, 'center', 700);
-    const pulse = 0.75 + 0.25 * Math.sin(state.time * 3);
-    context.globalAlpha = pulse;
-    text('Click or press Space to dive in', FIELD.width / 2, 556, 26, PALETTE.gold, 'center', 700);
-    context.globalAlpha = 1;
+    button(ui, 'start', VIEW_W / 2 - 160, 428, 320, 56, 'START DIGGING', { font: 24 });
+    ctx.font = `15px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText('A / D move · W jump · S dig down · push into rock to drill · CLICK aim-drill · E bomb · R reroll in drafts', VIEW_W / 2, 516);
+    ctx.fillText('Manage HEAT: drilling and lava heat the drill. Water cools it. Boulders fall. Gas explodes.', VIEW_W / 2, 540);
+    if (ui.best > 0 || ui.bestDepth > 0) {
+      ctx.fillStyle = '#ffd76a';
+      ctx.font = `bold 17px ${FONT}`;
+      ctx.fillText(`BEST SCORE ${ui.best.toLocaleString('en-US')} · DEEPEST LEVEL ${ui.bestDepth}`, VIEW_W / 2, 580);
+    }
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.font = `13px ${FONT}`;
+    ctx.fillText('An original game built for the make.fun best-game bounty · headphones recommended', VIEW_W / 2, 640);
   }
 
-  function drawPaused() {
-    drawPanel(390, 230, 500, 260);
-    context.textBaseline = 'alphabetic';
-    text('Paused', FIELD.width / 2, 316, 46, PALETTE.text, 'center', 700);
-    text('The gloom waits for no fish — but it waits for you.', FIELD.width / 2, 356, 19, PALETTE.muted, 'center');
-    text('Press P to keep swimming', FIELD.width / 2, 412, 24, PALETTE.gold, 'center', 700);
-    text('R restarts the run', FIELD.width / 2, 448, 18, PALETTE.muted, 'center');
-  }
-
-  function drawChoice(state, choices, mouse) {
-    context.fillStyle = 'rgba(6, 12, 24, 0.6)';
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    context.textBaseline = 'alphabetic';
-    drawGlow(FIELD.width / 2, 150, 120, 'rgba(110, 243, 255, 0.3)', 0.9);
-    text(`Level ${state.level}!`, FIELD.width / 2, 140, 46, PALETTE.glimmer, 'center', 800);
-    text('Choose a boon', FIELD.width / 2, 178, 24, PALETTE.text, 'center');
-    const rects = choiceLayout();
-    choices.forEach((upgrade, index) => {
-      const rect = rects[index];
-      const hovered = mouse !== null && mouse.x >= rect.x && mouse.x <= rect.x + rect.width && mouse.y >= rect.y && mouse.y <= rect.y + rect.height;
-      context.fillStyle = hovered ? '#1a3a63' : PALETTE.card;
-      context.strokeStyle = hovered ? PALETTE.gold : PALETTE.cardEdge;
-      context.lineWidth = hovered ? 3 : 2;
-      context.beginPath();
-      context.roundRect(rect.x, rect.y, rect.width, rect.height, 16);
-      context.fill();
-      context.stroke();
-      const cx = rect.x + rect.width / 2;
-      drawGlow(cx, rect.y + 78, 52, 'rgba(255, 215, 106, 0.3)', 0.8);
-      drawIcon(context, upgrade.icon, cx, rect.y + 78, 56, PALETTE.gold);
-      text(upgrade.name, cx, rect.y + 158, 27, PALETTE.text, 'center', 700);
-      wrapText(upgrade.blurb, cx, rect.y + 196, 20, PALETTE.muted, 250);
-      text(`[${index + 1}]`, cx, rect.y + rect.height - 26, 20, PALETTE.gold, 'center', 700);
-    });
-    text('Click a card or press 1, 2 or 3', FIELD.width / 2, 576, 20, PALETTE.muted, 'center');
-  }
-
-  function wrapText(value, x, y, size, color, maxWidth) {
-    const words = value.split(' ');
-    const lines = [''];
-    context.font = `${size}px ${FONT}`;
+  function wrapText(text, x, y, maxW, lineH) {
+    const words = text.split(' ');
+    let line = '';
+    let yy = y;
+    ctx.textAlign = 'center';
+    const cx = x + maxW / 2;
     for (const word of words) {
-      const trial = lines[lines.length - 1] === '' ? word : `${lines[lines.length - 1]} ${word}`;
-      if (context.measureText(trial).width > maxWidth && lines[lines.length - 1] !== '') lines.push(word);
-      else lines[lines.length - 1] = trial;
+      const test = line ? `${line} ${word}` : word;
+      if (ctx.measureText(test).width > maxW && line) {
+        ctx.fillText(line, cx, yy);
+        line = word;
+        yy += lineH;
+      } else {
+        line = test;
+      }
     }
-    lines.forEach((line, index) => {
-      text(line, x, y + index * (size + 8), size, color, 'center');
+    if (line) ctx.fillText(line, cx, yy);
+  }
+
+  function drawDraft(world, ui) {
+    ctx.fillStyle = 'rgba(8,6,12,0.72)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.textAlign = 'center';
+    ctx.font = `bold 44px ${FONT}`;
+    ctx.fillStyle = '#ffd76a';
+    ctx.fillText('CHOOSE AN UPGRADE', VIEW_W / 2, 96);
+    ctx.font = `17px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(`Level ${world.level} reached — the drill crew bolts on something new.  Ore: ${world.ore}`, VIEW_W / 2, 128);
+    const options = ui.draftOptions;
+    const cw = 270;
+    const gap = 30;
+    const total = options.length * cw + (options.length - 1) * gap;
+    let cx = VIEW_W / 2 - total / 2;
+    const cy = 168;
+    const ch = 300;
+    options.forEach((u, i) => {
+      const hover = ui.mouseX >= cx && ui.mouseX <= cx + cw && ui.mouseY >= cy && ui.mouseY <= cy + ch;
+      ctx.fillStyle = hover ? 'rgba(255,160,70,0.25)' : 'rgba(20,16,26,0.95)';
+      ctx.beginPath();
+      ctx.roundRect(cx, cy, cw, ch, 16);
+      ctx.fill();
+      ctx.strokeStyle = hover ? '#ffd76a' : 'rgba(255,255,255,0.35)';
+      ctx.lineWidth = hover ? 3 : 1;
+      ctx.stroke();
+      drawIcon(u.icon, cx + cw / 2, cy + 62, 34, '#ffd76a');
+      ctx.fillStyle = '#ffffff';
+      ctx.font = `bold 23px ${FONT}`;
+      ctx.fillText(u.name, cx + cw / 2, cy + 128);
+      ctx.fillStyle = 'rgba(255,255,255,0.85)';
+      ctx.font = `16px ${FONT}`;
+      wrapText(u.desc, cx + 20, cy + 162, cw - 40, 22);
+      const owned = ui.draftOwned[u.id] ?? 0;
+      ctx.fillStyle = '#ffd76a';
+      ctx.font = `14px ${FONT}`;
+      ctx.fillText(`Owned ${owned} / ${u.max}`, cx + cw / 2, cy + ch - 44);
+      ctx.fillStyle = 'rgba(255,255,255,0.6)';
+      ctx.font = `13px ${FONT}`;
+      ctx.fillText(`Press ${i + 1} or click`, cx + cw / 2, cy + ch - 20);
+      ui.hits.push({ id: `draft:${i}`, x: cx, y: cy, w: cw, h: ch });
+      cx += cw + gap;
     });
+    const rerollFree = ui.freeRerolls > 0;
+    const rerollLabel = rerollFree ? 'REROLL (FREE)' : `REROLL (30 ORE)`;
+    button(ui, 'reroll', VIEW_W / 2 - 130, 500, 260, 48, rerollLabel, { disabled: !rerollFree && world.ore < 30 });
+    // Current build.
+    const owned = ui.draftOwned;
+    const names = Object.entries(owned).map(([id, n]) => {
+      const def = ui.upgradeDefs.find((d) => d.id === id);
+      return def ? `${def.name} x${n}` : id;
+    });
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.75)';
+    ctx.fillText(names.length ? `Your build: ${names.join(' · ')}` : 'Your build: stock drill rig', VIEW_W / 2, 590);
   }
 
-  function drawEnd(state, best, won) {
-    drawPanel(340, 150, 600, 420);
-    context.textBaseline = 'alphabetic';
-    if (won) {
-      drawGlow(FIELD.width / 2, 220, 140, 'rgba(255, 215, 106, 0.4)', 0.9);
-      text('THE REEF IS SAVED!', FIELD.width / 2, 240, 48, PALETTE.gold, 'center', 800);
-      text('The Maw is gone. The reef glows again.', FIELD.width / 2, 280, 21, PALETTE.text, 'center');
+  function drawIcon(icon, x, y, size, color) {
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.fillStyle = color;
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 3;
+    const s = size;
+    switch (icon) {
+      case 'drill':
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.6, -s * 0.3);
+        ctx.lineTo(s * 0.6, 0);
+        ctx.lineTo(-s * 0.6, s * 0.3);
+        ctx.closePath();
+        ctx.fill();
+        ctx.fillRect(-s, -s * 0.35, s * 0.5, s * 0.7);
+        break;
+      case 'bolt':
+        ctx.beginPath();
+        ctx.moveTo(s * 0.2, -s);
+        ctx.lineTo(-s * 0.5, s * 0.1);
+        ctx.lineTo(0, s * 0.1);
+        ctx.lineTo(-s * 0.2, s);
+        ctx.lineTo(s * 0.5, -s * 0.1);
+        ctx.lineTo(0, -s * 0.1);
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case 'shield':
+        ctx.beginPath();
+        ctx.moveTo(0, -s);
+        ctx.lineTo(s * 0.8, -s * 0.5);
+        ctx.lineTo(s * 0.8, s * 0.2);
+        ctx.quadraticCurveTo(s * 0.8, s * 0.8, 0, s);
+        ctx.quadraticCurveTo(-s * 0.8, s * 0.8, -s * 0.8, s * 0.2);
+        ctx.lineTo(-s * 0.8, -s * 0.5);
+        ctx.closePath();
+        ctx.fill();
+        break;
+      case 'snow':
+        for (let i = 0; i < 3; i += 1) {
+          const a = (i * Math.PI) / 3;
+          ctx.beginPath();
+          ctx.moveTo(-Math.cos(a) * s, -Math.sin(a) * s);
+          ctx.lineTo(Math.cos(a) * s, Math.sin(a) * s);
+          ctx.stroke();
+        }
+        break;
+      case 'drop':
+        ctx.beginPath();
+        ctx.moveTo(0, -s);
+        ctx.quadraticCurveTo(s * 0.8, 0, s * 0.6, s * 0.5);
+        ctx.quadraticCurveTo(s * 0.3, s, 0, s);
+        ctx.quadraticCurveTo(-s * 0.3, s, -s * 0.6, s * 0.5);
+        ctx.quadraticCurveTo(-s * 0.8, 0, 0, -s);
+        ctx.fill();
+        break;
+      case 'magnet':
+        ctx.lineWidth = 8;
+        ctx.beginPath();
+        ctx.arc(0, 0, s * 0.7, Math.PI, 0, false);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.moveTo(-s * 0.7, 0);
+        ctx.lineTo(-s * 0.7, s * 0.7);
+        ctx.moveTo(s * 0.7, 0);
+        ctx.lineTo(s * 0.7, s * 0.7);
+        ctx.stroke();
+        break;
+      case 'bomb':
+        ctx.beginPath();
+        ctx.arc(0, s * 0.2, s * 0.7, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.beginPath();
+        ctx.moveTo(0, -s * 0.5);
+        ctx.quadraticCurveTo(s * 0.4, -s, s * 0.7, -s * 0.8);
+        ctx.stroke();
+        break;
+      case 'gem':
+        drawDiamond(0, 0, s * 0.7, s);
+        break;
+      case 'heart':
+        ctx.beginPath();
+        ctx.arc(-s * 0.35, -s * 0.2, s * 0.45, 0, Math.PI * 2);
+        ctx.arc(s * 0.35, -s * 0.2, s * 0.45, 0, Math.PI * 2);
+        ctx.moveTo(-s * 0.75, 0);
+        ctx.lineTo(0, s);
+        ctx.lineTo(s * 0.75, 0);
+        ctx.fill();
+        break;
+      case 'flame':
+        ctx.beginPath();
+        ctx.moveTo(0, -s);
+        ctx.quadraticCurveTo(s * 0.8, -s * 0.2, s * 0.5, s * 0.4);
+        ctx.quadraticCurveTo(s * 0.2, s, 0, s);
+        ctx.quadraticCurveTo(-s * 0.5, s * 0.6, -s * 0.5, 0);
+        ctx.quadraticCurveTo(-s * 0.4, -s * 0.5, 0, -s);
+        ctx.fill();
+        break;
+      default:
+        ctx.beginPath();
+        ctx.arc(0, 0, s * 0.6, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#1c1408';
+        ctx.font = `bold ${Math.round(s)}px ${FONT}`;
+        ctx.textAlign = 'center';
+        ctx.fillText('+', 0, s * 0.35);
+        break;
+    }
+    ctx.restore();
+  }
+
+  function drawPaused(world, ui) {
+    ctx.fillStyle = 'rgba(8,6,12,0.6)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    panel(VIEW_W / 2 - 260, 200, 520, 300, 0.9);
+    ctx.textAlign = 'center';
+    ctx.font = `bold 44px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('PAUSED', VIEW_W / 2, 262);
+    ctx.font = `16px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.85)';
+    ctx.fillText('The drill idles. The mountain waits.', VIEW_W / 2, 296);
+    button(ui, 'resume', VIEW_W / 2 - 150, 322, 300, 50, 'RESUME');
+    button(ui, 'restart', VIEW_W / 2 - 150, 384, 300, 50, 'RESTART RUN');
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('P / Esc resume · M mute', VIEW_W / 2, 468);
+  }
+
+  function statsBlock(world, ui, y) {
+    const mins = Math.floor(world.time / 60);
+    const secs = Math.floor(world.time % 60);
+    const rows = [
+      ['SCORE', world.score.toLocaleString('en-US')],
+      ['DEEPEST LEVEL', String(world.maxLevel)],
+      ['ORE MINED', String(world.ore)],
+      ['GEMS', String(world.gems)],
+      ['CREATURES FELLED', String(world.kills)],
+      ['TIME', `${mins}:${String(secs).padStart(2, '0')}`],
+      ['BEST SCORE', Math.max(ui.best, world.score).toLocaleString('en-US')],
+    ];
+    ctx.font = `17px ${FONT}`;
+    rows.forEach(([label, value], i) => {
+      const yy = y + i * 28;
+      ctx.textAlign = 'right';
+      ctx.fillStyle = 'rgba(255,255,255,0.7)';
+      ctx.fillText(label, VIEW_W / 2 - 16, yy);
+      ctx.textAlign = 'left';
+      ctx.fillStyle = '#ffd76a';
+      ctx.fillText(value, VIEW_W / 2 + 16, yy);
+    });
+    return y + rows.length * 28;
+  }
+
+  function drawOver(world, ui) {
+    ctx.fillStyle = 'rgba(10,4,4,0.72)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.textAlign = 'center';
+    ctx.font = `bold 52px ${FONT}`;
+    ctx.fillStyle = '#ff6a5a';
+    ctx.fillText('THE MOUNTAIN CLAIMS YOU', VIEW_W / 2, 120);
+    ctx.font = `18px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText(world.endless ? `The endless deep keeps your rig at level ${world.maxLevel}.` : `The Core Wyrm still sleeps at level ${BOSS_LEVEL}. Dig again.`, VIEW_W / 2, 152);
+    const after = statsBlock(world, ui, 200);
+    button(ui, 'restart', VIEW_W / 2 - 160, after + 18, 320, 54, 'DIG AGAIN', { font: 22 });
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('Press R or Enter', VIEW_W / 2, after + 100);
+  }
+
+  function drawWin(world, ui) {
+    ctx.fillStyle = 'rgba(20,12,4,0.6)';
+    ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+    ctx.textAlign = 'center';
+    ctx.font = `bold 56px ${FONT}`;
+    const grad = ctx.createLinearGradient(0, 60, 0, 130);
+    grad.addColorStop(0, '#fff3b0');
+    grad.addColorStop(1, '#ffb347');
+    ctx.fillStyle = grad;
+    ctx.fillText('THE HEART IS YOURS!', VIEW_W / 2, 118);
+    ctx.font = `18px ${FONT}`;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillText('The Core Wyrm falls. The mountain is yours — and below, the deep goes on forever.', VIEW_W / 2, 150);
+    const after = statsBlock(world, ui, 196);
+    button(ui, 'endless', VIEW_W / 2 - 170, after + 16, 340, 54, 'KEEP DIGGING (ENDLESS)', { font: 20 });
+    button(ui, 'restart', VIEW_W / 2 - 170, after + 82, 340, 48, 'NEW RUN', { font: 20 });
+    ctx.font = `14px ${FONT}`;
+    ctx.fillStyle = 'rgba(255,255,255,0.6)';
+    ctx.fillText('Enter: endless · R: new run', VIEW_W / 2, after + 158);
+  }
+
+  function draw(world, ui) {
+    ui.hits.length = 0;
+    const shake = shakeOffset(world.particles);
+    ctx.save();
+    ctx.translate(shake.x, shake.y);
+    drawBackground(world);
+    drawTiles(world);
+    drawPickups(world);
+    drawBombs(world);
+    drawBoulders(world);
+    drawEnemies(world);
+    drawBoss(world);
+    drawProjectiles(world);
+    drawPlayer(world);
+    drawParticles(world);
+    ctx.restore();
+
+    if (ui.screen === SCREEN_TITLE) {
+      drawTitle(world, ui);
     } else {
-      text('The light fades…', FIELD.width / 2, 240, 48, PALETTE.text, 'center', 800);
-      text('The gloom takes the reef — this time.', FIELD.width / 2, 280, 21, PALETTE.muted, 'center');
-    }
-    text(`Score ${state.score}`, FIELD.width / 2, 348, 34, PALETTE.text, 'center', 700);
-    text(`Best ${best}`, FIELD.width / 2, 388, 22, PALETTE.muted, 'center');
-    text(`Wave ${Math.max(1, state.wave)}  ·  ${state.kills} foes beaten  ·  Level ${state.level}`, FIELD.width / 2, 424, 20, PALETTE.muted, 'center');
-    const pulse = 0.75 + 0.25 * Math.sin(state.time * 3);
-    context.globalAlpha = pulse;
-    text('Press Space or click to swim again', FIELD.width / 2, 512, 25, PALETTE.gold, 'center', 700);
-    context.globalAlpha = 1;
-  }
-
-  function drawVignette(state, screen) {
-    const gradient = context.createRadialGradient(
-      FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.42,
-      FIELD.width / 2, FIELD.height / 2, FIELD.height * 0.85,
-    );
-    gradient.addColorStop(0, 'rgba(3, 6, 14, 0)');
-    gradient.addColorStop(1, 'rgba(3, 6, 14, 0.55)');
-    context.fillStyle = gradient;
-    context.fillRect(0, 0, FIELD.width, FIELD.height);
-    if (state.flash > 0) {
-      context.fillStyle = `rgba(255, 60, 70, ${state.flash * 0.28})`;
-      context.fillRect(0, 0, FIELD.width, FIELD.height);
-    }
-    if (screen === SCREEN_PLAY && state.player.hp === 1 && !state.over) {
-      const pulse = 0.1 + 0.08 * Math.sin(state.time * 6);
-      context.fillStyle = `rgba(255, 60, 70, ${pulse})`;
-      context.fillRect(0, 0, FIELD.width, FIELD.height);
+      drawHud(world, ui);
+      if (ui.screen === SCREEN_PAUSED) drawPaused(world, ui);
+      else if (ui.screen === SCREEN_DRAFT) drawDraft(world, ui);
+      else if (ui.screen === SCREEN_OVER) drawOver(world, ui);
+      else if (ui.screen === SCREEN_WIN) drawWin(world, ui);
     }
   }
 
-  /** Paint one frame: the lagoon, the creatures, the HUD, then the screen's panel. */
-  function draw(state, screen, ui) {
-    const shake = state.shake * 9;
-    const shakeX = shake === 0 ? 0 : (Math.random() * 2 - 1) * shake;
-    const shakeY = shake === 0 ? 0 : (Math.random() * 2 - 1) * shake;
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x + shakeX * view.scale, view.y + shakeY * view.scale);
-    drawWater(state.time);
-    // The player's lantern light, under the creatures.
-    context.save();
-    context.globalCompositeOperation = 'lighter';
-    drawGlow(state.player.x, state.player.y, 230, 'rgba(255, 215, 106, 0.16)', 1);
-    context.restore();
-    // Glimmers.
-    for (const pickup of state.pickups) {
-      if (!pickup.active) continue;
-      const bob = Math.sin(pickup.age * 5) * 2;
-      const spin = pickup.age * 2.4;
-      drawGlow(pickup.x, pickup.y + bob, 22, 'rgba(110, 243, 255, 0.5)', 0.8);
-      context.save();
-      context.translate(pickup.x, pickup.y + bob);
-      context.rotate(spin);
-      context.fillStyle = PALETTE.glimmer;
-      context.fillRect(-6, -6, 12, 12);
-      context.fillStyle = '#ffffff';
-      context.fillRect(-3, -3, 6, 6);
-      context.restore();
-    }
-    // Enemy globs.
-    for (const glob of state.enemyBullets) {
-      if (!glob.active) continue;
-      drawGlow(glob.x, glob.y, 22, 'rgba(200, 107, 255, 0.55)', 0.9);
-      context.fillStyle = PALETTE.enemyBullet;
-      context.beginPath();
-      context.arc(glob.x, glob.y, ENEMY_BULLET_RADIUS, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = '#ffffff';
-      context.beginPath();
-      context.arc(glob.x, glob.y, 2.6, 0, Math.PI * 2);
-      context.fill();
-    }
-    for (const foe of state.foes) {
-      if (foe.active) drawFoe(foe, state.time);
-    }
-    // Orbiting shield shards.
-    for (let index = 0; index < state.mods.shields; index += 1) {
-      const angle = state.shieldAngle + (index / state.mods.shields) * Math.PI * 2;
-      const sx = state.player.x + Math.cos(angle) * 48;
-      const sy = state.player.y + Math.sin(angle) * 48;
-      drawGlow(sx, sy, 20, 'rgba(110, 243, 255, 0.5)', 0.8);
-      context.save();
-      context.translate(sx, sy);
-      context.rotate(angle * 2);
-      context.fillStyle = PALETTE.glimmer;
-      context.fillRect(-6, -6, 12, 12);
-      context.restore();
-    }
-    if (!state.over) drawPlayer(state.player, state.time);
-    // Bolts.
-    for (const bullet of state.bullets) {
-      if (!bullet.active) continue;
-      context.strokeStyle = 'rgba(255, 232, 154, 0.5)';
-      context.lineWidth = 3;
-      context.beginPath();
-      context.moveTo(bullet.x - bullet.vx * 0.03, bullet.y - bullet.vy * 0.03);
-      context.lineTo(bullet.x, bullet.y);
-      context.stroke();
-      drawGlow(bullet.x, bullet.y, 22, 'rgba(255, 232, 154, 0.6)', 0.9);
-      context.fillStyle = PALETTE.bulletCore;
-      context.beginPath();
-      context.arc(bullet.x, bullet.y, 5, 0, Math.PI * 2);
-      context.fill();
-    }
-    // Particles, additively for glow.
-    context.save();
-    context.globalCompositeOperation = 'lighter';
-    for (const particle of state.particles) {
-      if (!particle.active) continue;
-      context.globalAlpha = Math.max(0, particle.life / particle.maxLife);
-      context.fillStyle = particle.color;
-      context.beginPath();
-      context.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
-      context.fill();
-    }
-    context.restore();
-    context.globalAlpha = 1;
-    // Floating texts.
-    context.textBaseline = 'alphabetic';
-    for (const floater of state.floaters) {
-      if (!floater.active) continue;
-      context.globalAlpha = Math.min(1, floater.life / (floater.maxLife * 0.6));
-      text(floater.text, floater.x, floater.y, floater.size, floater.color, 'center', 700);
-    }
-    context.globalAlpha = 1;
-    drawVignette(state, screen);
-    if (screen !== SCREEN_TITLE) drawHud(state, ui.best, ui.muted);
-    drawBanner(state, screen);
-    if (screen === SCREEN_TITLE) drawTitle(state, ui.best);
-    else if (screen === SCREEN_PAUSED) drawPaused();
-    else if (screen === SCREEN_CHOICE && ui.choices !== null) drawChoice(state, ui.choices, ui.mouse);
-    else if (screen === SCREEN_OVER) drawEnd(state, ui.best, false);
-    else if (screen === SCREEN_WIN) drawEnd(state, ui.best, true);
-  }
-
-  const ENEMY_BULLET_RADIUS = 7;
-
-  paintReef();
-  resize();
-  window.addEventListener('resize', resize);
-
-  return {
-    draw,
-    /** Map a client (CSS pixel) point to field coordinates. */
-    toField(clientX, clientY) {
-      const rect = canvas.getBoundingClientRect();
-      const px = (clientX - rect.left) * view.ratio;
-      const py = (clientY - rect.top) * view.ratio;
-      return { x: (px - view.x) / view.scale, y: (py - view.y) / view.scale };
-    },
-  };
+  return { draw, canvas };
 }

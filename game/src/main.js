@@ -1,274 +1,305 @@
 // Boot and the one loop: input is read every frame, the world advances in
-// fixed 1/60 s steps (several in a slow frame, none in a fast one), and the
-// renderer paints what is there. The game moves between six screens: title,
-// play, paused, level-up choice, game over and victory.
+// fixed 1/60 s steps, and the renderer paints what is there. The game moves
+// between six screens: title, play, paused, draft, game over and victory.
 //
-// ?seed=N fixes the run. ?shot=title|play|choice|end (with &seed=N) stages
-// that scene instead of running the loop, paints it twice and sets
-// window.__shotReady for a screenshot.
-import { BEST_KEY, MUTE_KEY, STEP } from './config.js';
-import { createRandom } from './random.js';
-import {
-  createWorld,
-  EVENT_BOSS,
-  EVENT_DASH,
-  EVENT_HIT,
-  EVENT_KILL,
-  EVENT_LEVELUP,
-  EVENT_OVER,
-  EVENT_PICKUP,
-  EVENT_REVIVE,
-  EVENT_SHOT,
-  EVENT_WAVE,
-  EVENT_WIN,
-} from './world.js';
-import {
-  ACTION_CHOICE_1,
-  ACTION_CHOICE_2,
-  ACTION_CHOICE_3,
-  ACTION_CONFIRM,
-  ACTION_DASH,
-  ACTION_MUTE,
-  ACTION_PAUSE,
-  ACTION_RESTART,
-  createInput,
-} from './input.js';
-import {
-  SCREEN_CHOICE,
-  SCREEN_OVER,
-  SCREEN_PAUSED,
-  SCREEN_PLAY,
-  SCREEN_TITLE,
-  SCREEN_WIN,
-  choiceLayout,
-  createRenderer,
-} from './render.js';
-import { rollUpgrades, takeUpgrade } from './upgrades.js';
+// ?seed=N fixes the world. ?shot=start|draft|cover|victory|end (with &seed=N)
+// stages that scene instead of running the loop, paints it and sets
+// window.__shotReady for a screenshot. window.__game exposes read-only state
+// for playtesting.
+import { BEST_KEY, DEPTH_KEY, DIFFICULTIES, STEP } from './config.js';
+import { createWorld, EVENT_BOSS, EVENT_DRAFT, EVENT_LEVEL, EVENT_OVER, EVENT_WIN, startEndless, stepWorld } from './world.js';
 import { createAudio } from './audio.js';
+import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, ACTION_REROLL, createInput } from './input.js';
+import { createRenderer, SCREEN_DRAFT, SCREEN_OVER, SCREEN_PAUSED, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
+import { applyUpgrade, rollDraft, UPGRADE_POOL } from './upgrades.js';
 import { stageShot } from './shots.js';
 
-/** The longest frame the loop catches up on; a longer stall is dropped, not replayed. */
 const MAX_FRAME = 0.25;
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
 const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
 const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
-const choiceRandom = createRandom((seed ^ 0x5f3a) >>> 0);
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
-const world = createWorld(seed);
+const audio = createAudio();
 const renderer = createRenderer(canvas);
 
-function readStored(key, fallback) {
+const ui = {
+  screen: SCREEN_TITLE,
+  hits: [],
+  mouseX: 0,
+  mouseY: 0,
+  best: 0,
+  bestDepth: 0,
+  selectedDifficulty: 'prospector',
+  difficulties: [DIFFICULTIES.surveyor, DIFFICULTIES.prospector, DIFFICULTIES.helldiver],
+  draftOptions: [],
+  draftOwned: {},
+  freeRerolls: 1,
+  upgradeDefs: UPGRADE_POOL,
+  muted: false,
+};
+
+function readNumber(key) {
   try {
-    const value = window.localStorage.getItem(key);
-    return value === null ? fallback : value;
+    return Number.parseInt(window.localStorage.getItem(key) ?? '0', 10) || 0;
   } catch {
-    return fallback;
+    return 0;
   }
 }
 
-function writeStored(key, value) {
+function saveNumber(key, value) {
   try {
-    window.localStorage.setItem(key, value);
+    window.localStorage.setItem(key, String(value));
   } catch {
-    // Storage can be off (private windows): the value then lasts this visit only.
+    // Storage can be off: the best then lasts this visit only.
   }
+}
+
+ui.best = readNumber(BEST_KEY);
+ui.bestDepth = readNumber(DEPTH_KEY);
+
+function announce(message) {
+  status.textContent = message;
+}
+
+function saveBest(world) {
+  if (world.score > ui.best) {
+    ui.best = world.score;
+    saveNumber(BEST_KEY, ui.best);
+  }
+  if (world.maxLevel > ui.bestDepth) {
+    ui.bestDepth = world.maxLevel;
+    saveNumber(DEPTH_KEY, ui.bestDepth);
+  }
+}
+
+function openDraft(world) {
+  ui.draftOptions = rollDraft(world.rand, world.owned, 3);
+  ui.draftOwned = world.owned;
+  ui.freeRerolls = world.freeRerolls;
+  ui.screen = SCREEN_DRAFT;
+  audio.draft();
+  announce('Choose an upgrade.');
+}
+
+function pickDraft(world, index) {
+  const option = ui.draftOptions[index];
+  if (!option) return;
+  applyUpgrade(world.stats, world.owned, option);
+  if (world.stats.heal) {
+    world.player.hull = Math.min(world.stats.maxHull, world.player.hull + world.stats.heal);
+    world.stats.heal = 0;
+  }
+  world.draftPending = false;
+  world.freeRerolls = 1;
+  ui.screen = SCREEN_PLAY;
+  audio.pick();
+  announce(`${option.name} installed.`);
+}
+
+function rerollDraft(world) {
+  if (ui.freeRerolls > 0) {
+    ui.freeRerolls -= 1;
+    world.freeRerolls = ui.freeRerolls;
+  } else if (world.ore >= 30) {
+    world.ore -= 30;
+  } else {
+    return;
+  }
+  ui.draftOptions = rollDraft(world.rand, world.owned, 3);
+  audio.click();
+}
+
+function hitAt(x, y) {
+  for (let i = ui.hits.length - 1; i >= 0; i -= 1) {
+    const h = ui.hits[i];
+    if (!h.disabled && x >= h.x && x <= h.x + h.w && y >= h.y && y <= h.y + h.h) return h;
+  }
+  return null;
 }
 
 function runShot(name) {
-  const scene = stageShot(name, world, seed);
-  const ui = { best: scene.best, muted: false, choices: scene.choices, mouse: null };
+  const difficulty = name === 'victory' ? DIFFICULTIES.surveyor : DIFFICULTIES.prospector;
+  let world = createWorld(seed, difficulty, audio);
+  const staged = stageShot(name, world, ui);
+  world = staged.world;
+  ui.screen = staged.screen;
+  ui.draftOwned = world.owned;
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, ui);
+    renderer.draw(world, ui);
     painted += 1;
-    if (painted < 2) requestAnimationFrame(paint);
-    else window.__shotReady = true;
+    if (painted < 3) requestAnimationFrame(paint);
+    else {
+      window.__shotReady = true;
+      window.__game = {
+        screen: ui.screen,
+        level: world.level,
+        score: world.score,
+        hull: Math.round(world.player.hull),
+        boss: world.boss ? { hp: Math.round(world.boss.hp), phase: world.boss.phase, state: world.boss.state } : null,
+        draftPending: world.draftPending,
+        hits: ui.hits.map((h) => h.id),
+      };
+    }
   }
   requestAnimationFrame(paint);
 }
 
 function runGame() {
   const input = createInput(canvas);
-  input.setFieldTransform((clientX, clientY) => renderer.toField(clientX, clientY));
-  const audio = createAudio(readStored(MUTE_KEY, '0') === '1');
-  let screen = SCREEN_TITLE;
-  let best = Number.parseInt(readStored(BEST_KEY, '0'), 10) || 0;
-  let choices = null;
+  let world = createWorld(seed, DIFFICULTIES[ui.selectedDifficulty], audio);
   let accumulator = 0;
   let last = performance.now();
 
-  function announce(message) {
-    status.textContent = message;
-  }
-
-  function toggleMute() {
-    audio.setMuted(!audio.isMuted());
-    writeStored(MUTE_KEY, audio.isMuted() ? '1' : '0');
-  }
-
-  function startGame() {
-    world.reset();
-    choices = null;
+  function startRun(difficultyId) {
+    const runSeed = params.has('seed') ? seed : Math.floor(Math.random() * 4294967296);
+    world = createWorld(runSeed, DIFFICULTIES[difficultyId], audio);
+    ui.selectedDifficulty = difficultyId;
+    ui.screen = SCREEN_PLAY;
     accumulator = 0;
-    screen = SCREEN_PLAY;
-    audio.unlock();
-    announce('Playing. Survive 10 waves and defeat the Maw.');
+    input.clear();
+    announce(`Digging. ${DIFFICULTIES[difficultyId].name} difficulty.`);
   }
 
-  function endGame(won) {
-    screen = won ? SCREEN_WIN : SCREEN_OVER;
-    if (world.state.score > best) {
-      best = world.state.score;
-      writeStored(BEST_KEY, String(best));
-    }
-    announce(won ? `The reef is saved! Score ${world.state.score}.` : `Game over. Score ${world.state.score}. Best ${best}.`);
-  }
-
-  function offerChoices() {
-    choices = rollUpgrades(choiceRandom, world.state.mods, 3);
-    screen = SCREEN_CHOICE;
-    announce(`Level ${world.state.level}. Choose a boon.`);
-  }
-
-  function choose(index) {
-    if (choices === null || index >= choices.length) return;
-    takeUpgrade(choices[index], world.state.mods, world.state.player);
-    world.state.pendingLevels -= 1;
-    audio.choose();
-    if (world.state.pendingLevels > 0) {
-      offerChoices();
-    } else {
-      choices = null;
-      screen = SCREEN_PLAY;
-      announce('Playing.');
-    }
-  }
-
-  /** Where bolts fly: the mouse when it has moved, else the nearest foe. */
-  function aimTarget() {
-    if (input.hasPointer()) return input.aimPoint();
-    const player = world.state.player;
-    let target = null;
-    let bestDist = Infinity;
-    for (const foe of world.state.foes) {
-      if (!foe.active) continue;
-      const dist = Math.hypot(foe.x - player.x, foe.y - player.y);
-      if (dist < bestDist) {
-        bestDist = dist;
-        target = foe;
+  function handleClicks() {
+    for (const click of input.takeClicks()) {
+      audio.unlock();
+      const hit = hitAt(click.x, click.y);
+      if (!hit) {
+        if (ui.screen === SCREEN_TITLE) audio.click();
+        continue;
+      }
+      audio.click();
+      const [kind, arg] = hit.id.split(':');
+      if (kind === 'diff') {
+        ui.selectedDifficulty = arg;
+      } else if (hit.id === 'start') {
+        startRun(ui.selectedDifficulty);
+      } else if (hit.id === 'resume') {
+        ui.screen = SCREEN_PLAY;
+      } else if (hit.id === 'restart') {
+        startRun(ui.selectedDifficulty);
+      } else if (hit.id === 'endless') {
+        startEndless(world);
+        ui.screen = SCREEN_PLAY;
+        announce('Endless descent. The deep goes on.');
+      } else if (hit.id === 'reroll') {
+        rerollDraft(world);
+      } else if (kind === 'draft') {
+        pickDraft(world, Number(arg));
       }
     }
-    if (target !== null) return { x: target.x, y: target.y };
-    return { x: player.x + Math.cos(player.face) * 120, y: player.y + Math.sin(player.face) * 120 };
   }
 
-  function playSounds(events) {
-    if (events & EVENT_SHOT) audio.shoot();
-    if (events & EVENT_KILL) audio.die(false);
-    if (events & EVENT_PICKUP) audio.pickup(world.state.combo);
-    if (events & EVENT_HIT) audio.hurt();
-    if (events & EVENT_DASH) audio.dash();
-    if (events & EVENT_WAVE) audio.waveStart();
-    if (events & EVENT_BOSS) audio.bossRoar();
-    if (events & EVENT_LEVELUP) audio.levelUp();
-    if (events & EVENT_REVIVE) audio.levelUp();
-    if (events & EVENT_WIN) audio.victory();
-    else if (events & EVENT_OVER) audio.gameOver();
-  }
-
-  /** Route one-shot presses for the current screen; returns the flags taken, so the loop can spend the dash press on its first step. */
   function handleActions() {
     const actions = input.takeActions();
-    if (actions & ACTION_MUTE) toggleMute();
-    if (screen === SCREEN_TITLE) {
-      if (actions & ACTION_CONFIRM) {
-        audio.click();
-        startGame();
-      }
-    } else if (screen === SCREEN_PLAY) {
-      if (actions & ACTION_PAUSE) {
-        screen = SCREEN_PAUSED;
+    if (actions & ACTION_MUTE) {
+      ui.muted = audio.toggleMute();
+    }
+    if (actions & ACTION_CONFIRM) {
+      audio.unlock();
+      if (ui.screen === SCREEN_TITLE) startRun(ui.selectedDifficulty);
+      else if (ui.screen === SCREEN_OVER) startRun(ui.selectedDifficulty);
+      else if (ui.screen === SCREEN_WIN) {
+        startEndless(world);
+        ui.screen = SCREEN_PLAY;
+      } else if (ui.screen === SCREEN_PAUSED) ui.screen = SCREEN_PLAY;
+    }
+    if (actions & ACTION_PAUSE) {
+      if (ui.screen === SCREEN_PLAY) {
+        ui.screen = SCREEN_PAUSED;
         announce('Paused.');
-      }
-    } else if (screen === SCREEN_PAUSED) {
-      if (actions & ACTION_RESTART) startGame();
-      else if (actions & (ACTION_PAUSE | ACTION_CONFIRM)) {
-        screen = SCREEN_PLAY;
+      } else if (ui.screen === SCREEN_PAUSED) {
+        ui.screen = SCREEN_PLAY;
         announce('Playing.');
       }
-    } else if (screen === SCREEN_CHOICE) {
-      if (actions & ACTION_CHOICE_1) choose(0);
-      else if (actions & ACTION_CHOICE_2) choose(1);
-      else if (actions & ACTION_CHOICE_3) choose(2);
-      for (const click of input.takeClicks()) {
-        const rects = choiceLayout();
-        for (let index = 0; index < rects.length; index += 1) {
-          const rect = rects[index];
-          if (click.x >= rect.x && click.x <= rect.x + rect.width && click.y >= rect.y && click.y <= rect.y + rect.height) {
-            choose(index);
-            break;
-          }
-        }
-      }
-    } else if (screen === SCREEN_OVER || screen === SCREEN_WIN) {
-      if (actions & (ACTION_CONFIRM | ACTION_RESTART)) {
-        audio.click();
-        startGame();
+    }
+    if (actions & ACTION_REROLL) {
+      if (ui.screen === SCREEN_DRAFT) rerollDraft(world);
+      else if (ui.screen === SCREEN_OVER || ui.screen === SCREEN_WIN) startRun(ui.selectedDifficulty);
+    }
+    const choice = input.takeChoice();
+    if (choice !== undefined) {
+      if (ui.screen === SCREEN_DRAFT) pickDraft(world, choice);
+      else if (ui.screen === SCREEN_TITLE && ui.difficulties[choice]) {
+        startRun(ui.difficulties[choice].id);
       }
     }
-    if (screen !== SCREEN_CHOICE) input.takeClicks();
-    return actions;
   }
 
   function frame(now) {
     requestAnimationFrame(frame);
     accumulator += Math.min((now - last) / 1000, MAX_FRAME);
     last = now;
-    const actions = handleActions();
-    if (screen === SCREEN_TITLE) {
+    ui.mouseX = input.state.mouseX;
+    ui.mouseY = input.state.mouseY;
+    handleClicks();
+    handleActions();
+    if (ui.screen === SCREEN_PLAY) {
       while (accumulator >= STEP) {
-        world.step(STEP, { move: { x: 0, y: 0 }, aim: { x: 0, y: 0 }, firing: false, dash: false }, true);
+        const events = stepWorld(world, input, STEP);
         accumulator -= STEP;
+        if (events & EVENT_DRAFT && !world.player.dead) openDraft(world);
+        if (events & EVENT_BOSS) announce('The Core Wyrm wakes!');
+        if (events & EVENT_LEVEL && world.level === 29) announce('The wyrm stirs below.');
+        if (events & EVENT_OVER) {
+          saveBest(world);
+          ui.screen = SCREEN_OVER;
+          audio.defeat();
+          announce(`The mountain claims you. Score ${world.score}.`);
+          break;
+        }
+        if (events & EVENT_WIN) {
+          saveBest(world);
+          ui.screen = SCREEN_WIN;
+          audio.victory();
+          announce(`Victory! Score ${world.score}.`);
+          break;
+        }
+        if (ui.screen !== SCREEN_PLAY) break;
       }
-    } else if (screen === SCREEN_PLAY) {
-      // Dash is a one-shot press: spend it on the first step of the frame.
-      let pendingDash = actions & ACTION_DASH;
-      while (accumulator >= STEP && screen === SCREEN_PLAY) {
-        const controls = {
-          move: input.moveVector(),
-          aim: aimTarget(),
-          firing: input.firing(),
-          dash: Boolean(pendingDash),
-        };
-        pendingDash = 0;
-        const events = world.step(STEP, controls, false);
-        playSounds(events);
-        if (events & EVENT_WIN) endGame(true);
-        else if (events & EVENT_OVER) endGame(false);
-        else if (world.state.pendingLevels > 0) offerChoices();
-        accumulator -= STEP;
-      }
-      if (screen !== SCREEN_PLAY) accumulator = 0;
     } else {
       accumulator = 0;
+      if (ui.screen === SCREEN_TITLE) {
+        // The title drifts slowly down the fresh shaft behind the menu.
+        world.cameraY = -20 + (Math.sin(now / 9000) * 0.5 + 0.5) * 120;
+        world.time += 1 / 60;
+      }
     }
-    const mouse = input.hasPointer() ? input.aimPoint() : null;
-    renderer.draw(world.state, screen, { best, muted: audio.isMuted(), choices, mouse });
+    const depthFrac = Math.min(1, world.level / 30);
+    audio.setIntensity(world.boss && !world.boss.dead ? 0.9 : 0.15 + depthFrac * 0.5);
+    renderer.draw(world, ui);
+    window.__game = {
+      screen: ui.screen,
+      level: world.level,
+      maxLevel: world.maxLevel,
+      score: world.score,
+      hull: Math.round(world.player.hull),
+      heat: Math.round(world.player.heat),
+      ore: world.ore,
+      gems: world.gems,
+      kills: world.kills,
+      draftPending: world.draftPending,
+      endless: world.endless,
+      boss: world.boss ? { hp: Math.round(world.boss.hp), phase: world.boss.phase, state: world.boss.state, dead: world.boss.dead } : null,
+      player: { x: Math.round(world.player.x), y: Math.round(world.player.y) },
+    };
   }
 
-  // Leaving the tab pauses a running game rather than letting the gloom close in unseen.
   document.addEventListener('visibilitychange', () => {
-    if (document.hidden && screen === SCREEN_PLAY) {
-      screen = SCREEN_PAUSED;
+    if (document.hidden && ui.screen === SCREEN_PLAY) {
+      ui.screen = SCREEN_PAUSED;
       announce('Paused.');
     }
   });
+  window.addEventListener('pointerdown', () => audio.unlock(), { once: true });
+  window.addEventListener('keydown', () => audio.unlock(), { once: true });
 
-  announce('Lumen Reef. Press Space or click to start.');
+  announce('Corebreak. Choose a difficulty and start digging.');
   requestAnimationFrame(frame);
 }
 
